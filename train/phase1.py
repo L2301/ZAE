@@ -9,6 +9,7 @@ Phase 1 Training: Vector Encoder/Decoder Reconstruction
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 import json
 import os
 import sys
@@ -57,6 +58,9 @@ def train_phase1(
     # Early stopping
     target_loss=0.1,
     patience_steps=200,
+    # Learning rate scheduler
+    warmup_steps=1000,
+    min_lr=1e-6,
     # Checkpointing
     checkpoint_dir='checkpoints/train',
     device=None,  # Auto-detect if None
@@ -102,6 +106,31 @@ def train_phase1(
     optimizer = optim.AdamW(
         [p for p in harness.parameters() if p.requires_grad],
         lr=learning_rate
+    )
+    
+    # Learning rate scheduler: linear warmup + cosine annealing
+    # Calculate total steps for cosine annealing (max_steps - warmup_steps)
+    cosine_steps = max(1, max_steps - warmup_steps)
+    
+    # Warmup scheduler: linear increase from 0 to learning_rate
+    # At step warmup_steps, we switch to cosine, so warmup should reach 1.0 at step warmup_steps-1
+    warmup_scheduler = LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: min(step / max(1, warmup_steps), 1.0) if step < warmup_steps else 1.0
+    )
+    
+    # Cosine annealing scheduler: decay from learning_rate to min_lr
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_steps,
+        eta_min=min_lr
+    )
+    
+    # Sequential scheduler: warmup then cosine
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps]
     )
     
     # Training state
@@ -154,10 +183,12 @@ def train_phase1(
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
         
         # Logging
         losses.append(loss.item())
         step += 1
+        current_lr = optimizer.param_groups[0]['lr']
         
         # Track training examples
         training_examples.append({
@@ -190,6 +221,7 @@ def train_phase1(
             'sse_loss': f'{sse_loss.item():.4f}',
             'cos_loss': f'{cos_loss.item():.4f}',
             'avg_loss': f'{avg_loss:.4f}',
+            'lr': f'{current_lr:.2e}',
             'target': f'{below_target_count}/{patience_steps}'
         })
         pbar.update(1)
@@ -209,11 +241,14 @@ def train_phase1(
             'batch_size': batch_size,
             'seq_len': seq_len,
             'learning_rate': learning_rate,
+            'warmup_steps': warmup_steps,
+            'min_lr': min_lr,
             'target_loss': target_loss,
             'patience_steps': patience_steps,
         },
         'final_step': step,
         'final_loss': loss.item(),
+        'final_lr': optimizer.param_groups[0]['lr'],
         'total_flops': total_flops,
         'training_examples': training_examples,
     }
@@ -228,6 +263,7 @@ def train_phase1(
         'step': step,
         'model_state_dict': harness.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
         'loss': loss.item(),
         'config': training_data['config'],
     }, os.path.join(model_dir, 'checkpoint.pt'))
