@@ -242,7 +242,7 @@ if __name__ == '__main__':
     train_phase1(
         batch_size=32,
         seq_len=1,
-        learning_rate=5e-5,
+        learning_rate=5e-4,
         max_steps=1000000,
         eval_interval=100,
     )
