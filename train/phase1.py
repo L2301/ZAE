@@ -241,7 +241,7 @@ def train_phase1(
 if __name__ == '__main__':
     train_phase1(
         batch_size=32,
-        seq_len=64,
+        seq_len=1,
         learning_rate=3e-4,
         max_steps=100000,
         eval_interval=100,
