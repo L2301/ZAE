@@ -16,10 +16,6 @@ from encoder import SequenceEncoder
 from data import SequenceEncoderDataset
 import urllib.request
 
-
-import urllib.request
-
-
 def download_encoder_from_github(output_path='checkpoints/encoder_from_github.pt'):
     """Download pretrained encoder from GitHub releases."""
     url = "https://github.com/L2301/ZAE/releases/download/chora-snapshot-2025-11-20/final_model.pt"
@@ -42,6 +38,8 @@ class RouterDataset(Dataset):
     Label mapping:
         0: normal token (raw embedding)
         1: sequence-compressed token
+    
+    Generates mixed batches with 50% normal, 50% compressed tokens.
     """
     
     def __init__(self, gpt_core, embedding, encoder, dataset_path, 
@@ -65,7 +63,7 @@ class RouterDataset(Dataset):
         self.n_samples = min(len(self.data) // seq_length, max_samples)
     
     def __len__(self):
-        return self.n_samples * 2  # Each sample generates 2 examples (normal + compressed)
+        return self.n_samples * 2  # Each sequence generates 2 examples (normal + compressed)
     
     def __getitem__(self, idx):
         """Generate training example on-the-fly."""
@@ -200,8 +198,8 @@ def train_router(
     
     # Early stopping
     low_loss_counter = 0
-    low_loss_threshold = 0.1
-    low_loss_steps = 200
+    low_loss_threshold = 0.01
+    low_loss_steps = 500
     
     # Temperature annealing schedule
     total_steps = len(dataloader) * n_epochs
