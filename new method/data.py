@@ -145,17 +145,65 @@ def load_training_data(data_dir):
 
 
 class SequenceEncoderDataset(torch.utils.data.Dataset):
-    """PyTorch Dataset for sequence encoder training."""
+    """PyTorch Dataset for sequence encoder training.
     
-    def __init__(self, input_embeddings, hidden_states):
-        self.input_embeddings = input_embeddings
-        self.hidden_states = hidden_states
+    Lazy dataset that generates input_embeddings and hidden_states on-the-fly
+    to avoid storing all data in memory.
+    """
+    
+    def __init__(self, gpt_core, embedding, dataset_path, seq_length=128, max_samples=100000, device='cpu'):
+        """
+        Args:
+            gpt_core: GPT model core (GPTCore instance)
+            embedding: GPT embedding layer (Embedding instance)
+            dataset_path: Path to tokenized dataset (memmap file)
+            seq_length: Length of sequences to extract
+            max_samples: Maximum number of samples in dataset
+            device: Device to run GPT model on
+        """
+        self.gpt_core = gpt_core.to(device)
+        self.embedding = embedding.to(device)
+        self.gpt_core.eval()
+        self.embedding.eval()
+        self.device = device
+        self.seq_length = seq_length
+        
+        # Load tokenized dataset as memmap
+        dataset_path = Path(dataset_path) if dataset_path else None
+        if dataset_path is None or not dataset_path.exists():
+            print("No dataset provided, downloading wikitext-103...")
+            dataset_path = Path(download_and_tokenize_wikitext())
+        
+        self.data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
+        
+        # Calculate number of available samples
+        self.n_samples = min(len(self.data) // seq_length, max_samples)
+        self.d_model = 768  # GPT-2 embedding dimension
         
     def __len__(self):
-        return len(self.input_embeddings)
+        return self.n_samples
     
     def __getitem__(self, idx):
+        """Generate a single training example on-the-fly."""
+        # Calculate start position in token array
+        start_idx = idx * self.seq_length
+        end_idx = start_idx + self.seq_length
+        
+        # Extract sequence
+        seq = self.data[start_idx:end_idx]
+        input_ids = torch.tensor(seq, dtype=torch.long, device=self.device).unsqueeze(0)
+        
+        # Extract hidden states and input embeddings
+        hidden_states, input_embeddings = extract_hidden_states(
+            self.gpt_core, self.embedding, input_ids
+        )
+        
+        # Remove last token (we use seq_length-1 for training)
+        # Shape: (1, seq_length, 768) -> (seq_length-1, 768)
+        input_embeddings = input_embeddings[0, :-1, :].cpu()
+        hidden_states = hidden_states[0, :-1, :].cpu()
+        
         return {
-            'input_embeddings': self.input_embeddings[idx],
-            'hidden_states': self.hidden_states[idx]
+            'input_embeddings': input_embeddings,
+            'hidden_states': hidden_states
         }

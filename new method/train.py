@@ -14,8 +14,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 from encoder import SequenceEncoder
 from data import (
     SequenceEncoderDataset, 
-    load_training_data,
-    generate_training_data,
     download_and_tokenize_wikitext
 )
 
@@ -118,12 +116,10 @@ def train_encoder(
     save_interval=1000,
     seq_length=128,
     max_samples=100000,
-    data_batch_size=32,
     contrastive_weight=1.0,
     variance_weight=0.1,
     repulsion_weight=0.5,
-    repulsion_margin=0.1,
-    pregenerated_data_dir=None
+    repulsion_margin=0.1
 ):
     """Train sequence encoder."""
     run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -137,34 +133,26 @@ def train_encoder(
     gpt_core, embedding = load_gpt_model(gpt_checkpoint_path)
     vocab_embeddings = embedding.wte.weight.data.to(device)
     
-    # Generate or load data
-    if pregenerated_data_dir:
-        print(f"Loading pre-generated data from {pregenerated_data_dir}...")
-        input_embeddings, hidden_states, metadata = load_training_data(pregenerated_data_dir)
-    else:
-        print("Generating training data...")
-        temp_data_dir = run_dir / 'data' / 'generated'
-        temp_data_dir.mkdir(exist_ok=True)
-        
-        generate_training_data(
-            gpt_core=gpt_core,
-            embedding=embedding,
-            dataset_path=dataset_path,
-            output_dir=temp_data_dir,
-            seq_length=seq_length,
-            batch_size=data_batch_size,
-            max_samples=max_samples,
-            device=device
-        )
-        
-        input_embeddings, hidden_states, metadata = load_training_data(temp_data_dir)
+    # Prepare dataset path
+    if dataset_path is None:
+        print("No dataset provided, will download wikitext-103 if needed...")
+        dataset_path = None  # Will be handled by dataset
     
-    # Create dataset
-    dataset = SequenceEncoderDataset(input_embeddings, hidden_states)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    # Create lazy dataset that generates examples on-the-fly
+    print("Creating lazy dataset...")
+    dataset = SequenceEncoderDataset(
+        gpt_core=gpt_core,
+        embedding=embedding,
+        dataset_path=dataset_path,
+        seq_length=seq_length,
+        max_samples=max_samples,
+        device=device
+    )
+    
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
     
     # Initialize encoder
-    d_model = metadata['d_model']
+    d_model = dataset.d_model
     encoder = SequenceEncoder(d_model=d_model).to(device)
     
     optimizer = torch.optim.AdamW(encoder.parameters(), lr=learning_rate, weight_decay=0.01)
@@ -174,7 +162,7 @@ def train_encoder(
     config = {
         'run_id': run_id,
         'gpt_checkpoint_path': str(gpt_checkpoint_path),
-        'dataset_path': str(dataset_path),
+        'dataset_path': str(dataset_path) if dataset_path else 'auto-downloaded',
         'd_model': d_model,
         'seq_length': seq_length,
         'n_epochs': n_epochs,
@@ -185,7 +173,7 @@ def train_encoder(
         'repulsion_weight': repulsion_weight,
         'repulsion_margin': repulsion_margin,
         'total_samples': len(dataset),
-        'max_samples_generated': max_samples
+        'max_samples': max_samples
     }
     
     with open(run_dir / 'data' / 'config.json', 'w') as f:
@@ -295,14 +283,12 @@ if __name__ == '__main__':
     parser.add_argument('--gpt_checkpoint', type=str, default='checkpoints/gpt_model.pt')
     parser.add_argument('--dataset_path', type=str, default=None)
     parser.add_argument('--output_dir', type=str, default='train/new')
-    parser.add_argument('--pregenerated_data', type=str, default=None)
     parser.add_argument('--n_epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--seq_length', type=int, default=128)
     parser.add_argument('--max_samples', type=int, default=100000)
-    parser.add_argument('--data_batch_size', type=int, default=32)
     parser.add_argument('--contrastive_weight', type=float, default=1.0)
     parser.add_argument('--variance_weight', type=float, default=0.1)
     parser.add_argument('--repulsion_weight', type=float, default=0.5)
@@ -320,10 +306,8 @@ if __name__ == '__main__':
         device=args.device,
         seq_length=args.seq_length,
         max_samples=args.max_samples,
-        data_batch_size=args.data_batch_size,
         contrastive_weight=args.contrastive_weight,
         variance_weight=args.variance_weight,
         repulsion_weight=args.repulsion_weight,
-        repulsion_margin=args.repulsion_margin,
-        pregenerated_data_dir=args.pregenerated_data
+        repulsion_margin=args.repulsion_margin
     )
