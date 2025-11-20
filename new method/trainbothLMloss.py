@@ -322,7 +322,6 @@ def train_joint_ce(
             epoch_losses['total'] += total_loss.item()
             epoch_losses['router'] += router_loss.item()
             epoch_losses['lm'] += lm_loss.item()
-            epoch_losses['repr'] += representation_loss.item()
             epoch_acc += acc.item()
             
             pbar.set_postfix({
@@ -340,7 +339,6 @@ def train_joint_ce(
                     'total_loss': total_loss.item(),
                     'router_loss': router_loss.item(),
                     'lm_loss': lm_loss.item(),
-                    'representation_loss': representation_loss.item(),
                     'accuracy': acc.item(),
                     'gpt_lr': optimizer.param_groups[0]['lr'],
                     'decoder_lr': optimizer.param_groups[1]['lr']
@@ -366,7 +364,6 @@ def train_joint_ce(
         print(f"  Total Loss: {epoch_losses['total']/n_batches:.4f}")
         print(f"  Router Loss: {epoch_losses['router']/n_batches:.4f}")
         print(f"  LM Loss: {epoch_losses['lm']/n_batches:.4f}")
-        print(f"  Repr Loss: {epoch_losses['repr']/n_batches:.4f}")
         print(f"  Accuracy: {epoch_acc/n_batches:.3f}")
     
     # Save final
