@@ -7,7 +7,7 @@ from tqdm import tqdm
 import uuid
 from datetime import datetime
 
-from sequence.encoder import SequenceEncoder
+from encoder import SequenceEncoder
 from generate_training_data import (
     SequenceEncoderDataset, 
     load_training_data,
