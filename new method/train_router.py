@@ -21,7 +21,7 @@ import urllib.request
 
 def download_encoder_from_github(output_path='checkpoints/encoder_from_github.pt'):
     """Download pretrained encoder from GitHub releases."""
-    url = "https://github.com/L2301/ZAE/releases/download/v0.1/final_model.pt"
+    url = "https://github.com/L2301/ZAE/releases/download/chora-snapshot-2025-11-20/final_model.pt"
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
