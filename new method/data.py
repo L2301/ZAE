@@ -4,121 +4,87 @@ import numpy as np
 from pathlib import Path
 import json
 from tqdm import tqdm
-import pickle
+import sys
+
+sys.path.append(str(Path(__file__).parent.parent))
 
 
-def load_gpt_model(checkpoint_path):
-    """Load pretrained GPT model components."""
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+def download_and_tokenize_wikitext(output_path='data/wikitext.bin', split='train'):
+    """Download and tokenize wikitext-103."""
+    from datasets import load_dataset
+    from transformers import GPT2TokenizerFast
     
-    from modelcore import GPTCore
-    from embedding import Embedding
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Extract config
-    config = checkpoint.get('config', {
-        'n_layer': 12,
-        'n_head': 12,
-        'n_embd': 768,
-        'block_size': 1024,
-        'dropout': 0.0,
-        'bias': True,
-        'vocab_size': 50257
-    })
+    if output_path.exists():
+        print(f"Using cached dataset at {output_path}")
+        return str(output_path)
     
-    # Initialize components
-    gpt_core = GPTCore(
-        n_layer=config['n_layer'],
-        n_head=config['n_head'],
-        n_embd=config['n_embd'],
-        block_size=config['block_size'],
-        dropout=config['dropout'],
-        bias=config['bias']
-    )
+    print("Downloading wikitext-103...")
+    dataset = load_dataset('wikitext', 'wikitext-103-raw-v1', split=split)
     
-    embedding = Embedding(
-        vocab_size=config['vocab_size'],
-        n_embd=config['n_embd'],
-        block_size=config['block_size']
-    )
+    print("Tokenizing...")
+    tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
     
-    # Load state dicts
-    gpt_core.load_state_dict(checkpoint['gpt_core'])
-    embedding.load_state_dict(checkpoint['embedding'])
+    all_tokens = []
+    for item in tqdm(dataset):
+        if item['text'].strip():
+            tokens = tokenizer.encode(item['text'])
+            all_tokens.extend(tokens)
     
-    gpt_core.eval()
-    embedding.eval()
+    tokens_array = np.array(all_tokens, dtype=np.uint16)
     
-    return gpt_core, embedding
+    print(f"Saving {len(tokens_array)} tokens to {output_path}")
+    tokens_array.tofile(output_path)
+    
+    return str(output_path)
 
 
 def extract_hidden_states(gpt_core, embedding, input_ids):
-    """
-    Extract final hidden states before the language modeling head.
-    
-    input_ids: (batch_size, seq_len)
-    returns: (hidden_states, token_embeddings)
-    """
+    """Extract final hidden states before the language modeling head."""
     with torch.no_grad():
-        # Get token-only embeddings (without positions)
-        tok_emb = embedding.token_only(input_ids)  # (B, T, n_embd)
-        
-        # Get full embeddings (with positions) for transformer
-        full_emb = embedding(input_ids)  # (B, T, n_embd)
-        
-        # Forward through transformer
-        hidden_states = gpt_core(full_emb)  # (B, T, n_embd)
-        
+        tok_emb = embedding.token_only(input_ids)
+        full_emb = embedding(input_ids)
+        hidden_states = gpt_core(full_emb)
         return hidden_states, tok_emb
 
 
 def generate_training_data(
     gpt_core,
     embedding,
-    dataset_path,
-    output_dir,
+    dataset_path=None,
+    output_dir='data/encoder_training',
     seq_length=128,
     batch_size=32,
     max_samples=100000,
     device='cuda' if torch.cuda.is_available() else 'cpu'
 ):
-    """
-    Generate training data pairs: (input_embeddings, hidden_states).
-    
-    Args:
-        gpt_core: Pretrained GPTCore model
-        embedding: Embedding module
-        dataset_path: Path to tokenized dataset (numpy memmap or similar)
-        output_dir: Where to save training data
-        seq_length: Sequence length for chunks
-        batch_size: Batch size for processing
-        max_samples: Maximum number of samples to generate
-    """
+    """Generate training data pairs: (input_embeddings, hidden_states)."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    if dataset_path is None:
+        print("No dataset provided, downloading wikitext-103...")
+        dataset_path = download_and_tokenize_wikitext()
     
     gpt_core = gpt_core.to(device)
     embedding = embedding.to(device)
     gpt_core.eval()
     embedding.eval()
     
-    # Load dataset
     print(f"Loading dataset from {dataset_path}")
     data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
     
-    # Calculate number of chunks
     n_chunks = min(len(data) // seq_length, max_samples)
     print(f"Generating {n_chunks} training samples...")
     
-    # Storage
     all_input_embeddings = []
     all_hidden_states = []
     
-    # Generate samples in batches
     for i in tqdm(range(0, n_chunks, batch_size)):
         batch_end = min(i + batch_size, n_chunks)
-        actual_batch_size = batch_end - i
         
-        # Extract batch of sequences
         batch_sequences = []
         for j in range(i, batch_end):
             start_idx = j * seq_length
@@ -133,17 +99,12 @@ def generate_training_data(
         if not batch_sequences:
             break
             
-        # Convert to tensor
         input_ids = torch.tensor(np.array(batch_sequences), dtype=torch.long, device=device)
-        
-        # Extract hidden states and input embeddings
         hidden_states, input_embeddings = extract_hidden_states(gpt_core, embedding, input_ids)
         
-        # Move to CPU and store (exclude last token's hidden state used for prediction)
         all_input_embeddings.append(input_embeddings[:, :-1, :].cpu())
         all_hidden_states.append(hidden_states[:, :-1, :].cpu())
     
-    # Concatenate all batches
     print("Concatenating batches...")
     input_embeddings = torch.cat(all_input_embeddings, dim=0)
     hidden_states = torch.cat(all_hidden_states, dim=0)
@@ -152,16 +113,14 @@ def generate_training_data(
     print(f"Input embeddings shape: {input_embeddings.shape}")
     print(f"Hidden states shape: {hidden_states.shape}")
     
-    # Save data
     print("Saving training data...")
     torch.save({
         'input_embeddings': input_embeddings,
         'hidden_states': hidden_states,
-        'seq_length': seq_length - 1,  # -1 because we exclude last token
+        'seq_length': seq_length - 1,
         'n_samples': input_embeddings.shape[0]
     }, output_dir / 'training_data.pt')
     
-    # Save metadata
     metadata = {
         'seq_length': seq_length - 1,
         'n_samples': int(input_embeddings.shape[0]),
@@ -173,19 +132,15 @@ def generate_training_data(
         json.dump(metadata, f, indent=2)
     
     print(f"Training data saved to {output_dir}")
-    
     return input_embeddings, hidden_states
 
 
 def load_training_data(data_dir):
     """Load pre-generated training data."""
     data_dir = Path(data_dir)
-    
     data = torch.load(data_dir / 'training_data.pt')
-    
     with open(data_dir / 'metadata.json', 'r') as f:
         metadata = json.load(f)
-    
     return data['input_embeddings'], data['hidden_states'], metadata
 
 
@@ -204,34 +159,3 @@ class SequenceEncoderDataset(torch.utils.data.Dataset):
             'input_embeddings': self.input_embeddings[idx],
             'hidden_states': self.hidden_states[idx]
         }
-
-
-if __name__ == '__main__':
-    import argparse
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', type=str, required=True, help='Path to GPT checkpoint')
-    parser.add_argument('--dataset_path', type=str, required=True, help='Path to tokenized dataset')
-    parser.add_argument('--output_dir', type=str, default='data/encoder_training', help='Output directory')
-    parser.add_argument('--seq_length', type=int, default=128, help='Sequence length')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--max_samples', type=int, default=100000, help='Max samples to generate')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    
-    args = parser.parse_args()
-    
-    # Load model
-    print("Loading GPT model...")
-    gpt_core, embedding = load_gpt_model(args.model_path)
-    
-    # Generate training data
-    generate_training_data(
-        gpt_core=gpt_core,
-        embedding=embedding,
-        dataset_path=args.dataset_path,
-        output_dir=args.output_dir,
-        seq_length=args.seq_length,
-        batch_size=args.batch_size,
-        max_samples=args.max_samples,
-        device=args.device
-    )
