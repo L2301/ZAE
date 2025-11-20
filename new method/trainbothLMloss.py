@@ -328,7 +328,6 @@ def train_joint_ce(
                 'loss': f"{total_loss.item():.4f}",
                 'router': f"{router_loss.item():.4f}",
                 'lm': f"{lm_loss.item():.4f}",
-                'repr': f"{representation_loss.item():.4f}",
                 'acc': f"{acc.item():.3f}"
             })
             
