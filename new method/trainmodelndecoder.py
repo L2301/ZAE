@@ -14,8 +14,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from encoder import SequenceEncoder
 from decoder import SequenceDecoder
-from router import GumbelClassifier
-from lm_head import LMHead
+from ZAE.router import GumbelClassifier
+from model.lmhead import LMHead
 from data import download_and_tokenize_wikitext
 import urllib.request
 
