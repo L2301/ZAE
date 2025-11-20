@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 
 from encoder import SequenceEncoder
-from generate_training_data import (
+from data import (
     SequenceEncoderDataset, 
     load_training_data,
     generate_training_data,
