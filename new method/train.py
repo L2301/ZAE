@@ -11,7 +11,7 @@ import sys
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from ZAE.sequence.encoder import SequenceEncoder
+from encoder import SequenceEncoder
 from data import (
     SequenceEncoderDataset, 
     load_training_data,
