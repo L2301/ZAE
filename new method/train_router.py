@@ -10,7 +10,7 @@ import sys
 
 sys.path.append(str(Path(__file__).parent.parent))
 
-from router import GumbelClassifier
+from ZAE.router import GumbelClassifier
 from encoder import SequenceEncoder
 from data import SequenceEncoderDataset
 import urllib.request
