@@ -30,9 +30,9 @@ class LMHead(nn.Module):
         Args:
             embedding_weight: (vocab_size, d_model) token embedding weight matrix
         """
-        # Transpose because embedding is (vocab_size, d_model) 
-        # but linear layer expects (d_model, vocab_size)
-        self.lm_head.weight = nn.Parameter(embedding_weight.T)
+        # embedding_weight is (vocab_size, d_model)
+        # Linear layer weight should be (vocab_size, d_model) for out_features x in_features
+        self.lm_head.weight = nn.Parameter(embedding_weight)
     
     @classmethod
     def from_pretrained_gpt2(cls, model_name='gpt2'):
@@ -55,7 +55,7 @@ class LMHead(nn.Module):
         # Copy weights from HF model
         # In GPT-2, lm_head shares weights with wte (token embedding)
         lm_head.lm_head.weight = nn.Parameter(
-            hf_model.transformer.wte.weight.T.clone()
+            hf_model.transformer.wte.weight.clone()
         )
         
         return lm_head
