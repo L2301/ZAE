@@ -7,6 +7,7 @@ from tqdm import tqdm
 import uuid
 from datetime import datetime
 import sys
+import numpy as np
 
 sys.path.append(str(Path(__file__).parent.parent))
 
