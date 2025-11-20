@@ -247,9 +247,11 @@ def train_joint(
         pin_memory=False
     )
     
-    # Optimizer for trainable components only
-    trainable_params = list(gpt_core_trainable.parameters()) + list(decoder.parameters())
-    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate, weight_decay=0.01)
+    # Optimizer for trainable components with differential learning rates
+    optimizer = torch.optim.AdamW([
+        {'params': gpt_core_trainable.parameters(), 'lr': learning_rate},
+        {'params': decoder.parameters(), 'lr': learning_rate * 10}  # Decoder learns faster
+    ], weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) * n_epochs)
     
     # Save config
@@ -321,7 +323,8 @@ def train_joint(
             
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            torch.nn.utils.clip_grad_norm_(gpt_core_trainable.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             
