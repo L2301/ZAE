@@ -14,11 +14,10 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from encoder import SequenceEncoder
 from decoder import SequenceDecoder
-from router import GumbelClassifier
+from ZAE.router import GumbelClassifier
 from model.lmhead import LMHead
 from data import download_and_tokenize_wikitext
 import urllib.request
-
 
 def download_encoder_from_github(output_path='checkpoints/encoder_from_github.pt'):
     """Download pretrained encoder from GitHub releases."""
