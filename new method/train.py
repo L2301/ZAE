@@ -1,281 +1,304 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import numpy as np
 from pathlib import Path
 import json
 from tqdm import tqdm
-import uuid
-from datetime import datetime
-
-from encoder import SequenceEncoder
-from data import (
-    SequenceEncoderDataset, 
-    load_training_data,
-    generate_training_data,
-    load_gpt_model
-)
+import pickle
 
 
-def train_encoder(
-    gpt_checkpoint_path,
-    dataset_path,
-    output_dir='train/new',
-    n_epochs=10,
-    batch_size=64,
-    learning_rate=3e-4,
-    device='cuda' if torch.cuda.is_available() else 'cpu',
-    log_interval=100,
-    save_interval=1000,
-    # Data generation params
-    seq_length=128,
-    max_samples=100000,
-    data_batch_size=32,
-    # Loss weights
-    contrastive_weight=1.0,
-    variance_weight=0.1,
-    repulsion_weight=0.5,
-    repulsion_margin=0.1,
-    # Optional: use pre-generated data
-    pregenerated_data_dir=None
-):
-    """
-    Train sequence encoder. Generates training data if not provided.
+def load_gpt_model(checkpoint_path):
+    """Load pretrained GPT model components or initialize from scratch."""
+    from modelcore import GPTCore
+    from embedding import Embedding
     
-    Args:
-        gpt_checkpoint_path: Path to GPT checkpoint (for data generation and vocab)
-        dataset_path: Path to tokenized dataset for data generation
-        output_dir: Directory for checkpoints
-        pregenerated_data_dir: Optional pre-generated data dir (skips generation)
-    """
-    # Create run directory
-    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    run_dir = Path(output_dir) / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / 'data').mkdir(exist_ok=True)
-    (run_dir / 'model').mkdir(exist_ok=True)
+    checkpoint_path = Path(checkpoint_path)
     
-    # Load GPT model for vocab embeddings
-    print("Loading GPT model...")
-    gpt_core, embedding = load_gpt_model(gpt_checkpoint_path)
-    vocab_embeddings = embedding.wte.weight.data.to(device)
-    
-    # Generate or load training data
-    if pregenerated_data_dir:
-        print(f"Loading pre-generated data from {pregenerated_data_dir}...")
-        input_embeddings, hidden_states, metadata = load_training_data(pregenerated_data_dir)
-    else:
-        print("Generating training data...")
-        temp_data_dir = run_dir / 'data' / 'generated'
-        temp_data_dir.mkdir(exist_ok=True)
-        
-        generate_training_data(
-            gpt_core=gpt_core,
-            embedding=embedding,
-            dataset_path=dataset_path,
-            output_dir=temp_data_dir,
-            seq_length=seq_length,
-            batch_size=data_batch_size,
-            max_samples=max_samples,
-            device=device
-        )
-        
-        input_embeddings, hidden_states, metadata = load_training_data(temp_data_dir)
-    
-    # Create dataset and dataloader
-    dataset = SequenceEncoderDataset(input_embeddings, hidden_states)
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    # Initialize model
-    d_model = metadata['d_model']
-    encoder = SequenceEncoder(d_model=d_model).to(device)
-    vocab_embeddings = vocab_embeddings.to(device)
-    
-    # Optimizer
-    optimizer = torch.optim.AdamW(encoder.parameters(), lr=learning_rate, weight_decay=0.01)
-    
-    # Learning rate scheduler
-    total_steps = len(dataloader) * n_epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-    
-    # Training state
-    global_step = 0
-    training_log = []
-    
-    # Save training config
+    # Default config
     config = {
-        'run_id': run_id,
-        'gpt_checkpoint_path': str(gpt_checkpoint_path),
-        'dataset_path': str(dataset_path),
-        'd_model': d_model,
-        'seq_length': seq_length,
-        'n_epochs': n_epochs,
-        'batch_size': batch_size,
-        'learning_rate': learning_rate,
-        'contrastive_weight': contrastive_weight,
-        'variance_weight': variance_weight,
-        'repulsion_weight': repulsion_weight,
-        'repulsion_margin': repulsion_margin,
-        'total_samples': len(dataset),
-        'max_samples_generated': max_samples
+        'n_layer': 12,
+        'n_head': 12,
+        'n_embd': 768,
+        'block_size': 1024,
+        'dropout': 0.0,
+        'bias': True,
+        'vocab_size': 50257
     }
     
-    with open(run_dir / 'data' / 'config.json', 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    print(f"Training encoder on {len(dataset)} samples for {n_epochs} epochs")
-    print(f"Run ID: {run_id}")
-    
-    # Training loop
-    encoder.train()
-    for epoch in range(n_epochs):
-        epoch_losses = {'total': 0, 'contrastive': 0, 'variance': 0, 'repulsion': 0}
+    if checkpoint_path.exists():
+        # Load from checkpoint
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        config.update(checkpoint.get('config', {}))
         
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{n_epochs}")
-        for batch in pbar:
-            input_emb = batch['input_embeddings'].to(device)  # (B, seq_len, d_model)
-            hidden = batch['hidden_states'].to(device)  # (B, seq_len, d_model)
-            
-            # Encode both input and hidden sequences
-            encoded_input = encoder(input_emb)  # (B, d_model)
-            encoded_hidden = encoder(hidden)  # (B, d_model)
-            
-            # Compute losses
-            contrastive_loss = encoder.compute_contrastive_loss(encoded_input, encoded_hidden)
-            variance_loss = encoder.compute_variance_loss(encoded_input)
-            repulsion_loss = encoder.compute_vocab_repulsion_loss(
-                encoded_input, vocab_embeddings, margin=repulsion_margin
-            )
-            
-            # Combined loss
-            total_loss = (
-                contrastive_weight * contrastive_loss +
-                variance_weight * variance_loss +
-                repulsion_weight * repulsion_loss
-            )
-            
-            # Backward pass
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            
-            # Track losses
-            epoch_losses['total'] += total_loss.item()
-            epoch_losses['contrastive'] += contrastive_loss.item()
-            epoch_losses['variance'] += variance_loss.item()
-            epoch_losses['repulsion'] += repulsion_loss.item()
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{total_loss.item():.4f}",
-                'contr': f"{contrastive_loss.item():.4f}",
-                'var': f"{variance_loss.item():.4f}",
-                'rep': f"{repulsion_loss.item():.4f}"
-            })
-            
-            # Logging
-            if global_step % log_interval == 0:
-                log_entry = {
-                    'step': global_step,
-                    'epoch': epoch,
-                    'total_loss': total_loss.item(),
-                    'contrastive_loss': contrastive_loss.item(),
-                    'variance_loss': variance_loss.item(),
-                    'repulsion_loss': repulsion_loss.item(),
-                    'lr': scheduler.get_last_lr()[0]
-                }
-                training_log.append(log_entry)
-            
-            # Save checkpoint
-            if global_step % save_interval == 0 and global_step > 0:
-                checkpoint_path = run_dir / 'model' / f'checkpoint_step_{global_step}.pt'
-                torch.save({
-                    'step': global_step,
-                    'epoch': epoch,
-                    'model_state_dict': encoder.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'config': config
-                }, checkpoint_path)
-                print(f"\nSaved checkpoint: {checkpoint_path}")
-            
-            global_step += 1
+        gpt_core = GPTCore(
+            n_layer=config['n_layer'],
+            n_head=config['n_head'],
+            n_embd=config['n_embd'],
+            block_size=config['block_size'],
+            dropout=config['dropout'],
+            bias=config['bias']
+        )
         
-        # Epoch summary
-        n_batches = len(dataloader)
-        print(f"\nEpoch {epoch+1} Summary:")
-        print(f"  Total Loss: {epoch_losses['total']/n_batches:.4f}")
-        print(f"  Contrastive: {epoch_losses['contrastive']/n_batches:.4f}")
-        print(f"  Variance: {epoch_losses['variance']/n_batches:.4f}")
-        print(f"  Repulsion: {epoch_losses['repulsion']/n_batches:.4f}")
+        embedding = Embedding(
+            vocab_size=config['vocab_size'],
+            n_embd=config['n_embd'],
+            block_size=config['block_size']
+        )
+        
+        gpt_core.load_state_dict(checkpoint['gpt_core'])
+        embedding.load_state_dict(checkpoint['embedding'])
+    else:
+        # Initialize from scratch
+        print(f"Checkpoint not found. Initializing new model with GPT-2 Small config")
+        
+        gpt_core = GPTCore(
+            n_layer=config['n_layer'],
+            n_head=config['n_head'],
+            n_embd=config['n_embd'],
+            block_size=config['block_size'],
+            dropout=config['dropout'],
+            bias=config['bias']
+        )
+        
+        embedding = Embedding(
+            vocab_size=config['vocab_size'],
+            n_embd=config['n_embd'],
+            block_size=config['block_size']
+        )
+        
+        # Try to load pretrained GPT-2 weights from HuggingFace
+        try:
+            print("Attempting to load pretrained GPT-2 weights from HuggingFace...")
+            from transformers import GPT2LMHeadModel
+            
+            hf_model = GPT2LMHeadModel.from_pretrained('gpt2')
+            hf_sd = hf_model.state_dict()
+            
+            # Map HuggingFace state dict to our format
+            # GPTCore mapping
+            core_sd = {}
+            for i in range(config['n_layer']):
+                # Attention
+                core_sd[f'h.{i}.ln_1.weight'] = hf_sd[f'transformer.h.{i}.ln_1.weight']
+                core_sd[f'h.{i}.ln_1.bias'] = hf_sd[f'transformer.h.{i}.ln_1.bias']
+                core_sd[f'h.{i}.attn.c_attn.weight'] = hf_sd[f'transformer.h.{i}.attn.c_attn.weight']
+                core_sd[f'h.{i}.attn.c_attn.bias'] = hf_sd[f'transformer.h.{i}.attn.c_attn.bias']
+                core_sd[f'h.{i}.attn.c_proj.weight'] = hf_sd[f'transformer.h.{i}.attn.c_proj.weight']
+                core_sd[f'h.{i}.attn.c_proj.bias'] = hf_sd[f'transformer.h.{i}.attn.c_proj.bias']
+                
+                # MLP
+                core_sd[f'h.{i}.ln_2.weight'] = hf_sd[f'transformer.h.{i}.ln_2.weight']
+                core_sd[f'h.{i}.ln_2.bias'] = hf_sd[f'transformer.h.{i}.ln_2.bias']
+                core_sd[f'h.{i}.mlp.c_fc.weight'] = hf_sd[f'transformer.h.{i}.mlp.c_fc.weight']
+                core_sd[f'h.{i}.mlp.c_fc.bias'] = hf_sd[f'transformer.h.{i}.mlp.c_fc.bias']
+                core_sd[f'h.{i}.mlp.c_proj.weight'] = hf_sd[f'transformer.h.{i}.mlp.c_proj.weight']
+                core_sd[f'h.{i}.mlp.c_proj.bias'] = hf_sd[f'transformer.h.{i}.mlp.c_proj.bias']
+            
+            core_sd['ln_f.weight'] = hf_sd['transformer.ln_f.weight']
+            core_sd['ln_f.bias'] = hf_sd['transformer.ln_f.bias']
+            
+            gpt_core.load_state_dict(core_sd)
+            
+            # Embedding mapping
+            emb_sd = {
+                'wte.weight': hf_sd['transformer.wte.weight'],
+                'wpe.weight': hf_sd['transformer.wpe.weight']
+            }
+            embedding.load_state_dict(emb_sd)
+            
+            print("Successfully loaded GPT-2 weights")
+        except Exception as e:
+            print(f"Could not load pretrained weights: {e}")
+            print("Using random initialization")
     
-    # Save final model
-    final_path = run_dir / 'model' / 'final_model.pt'
+    gpt_core.eval()
+    embedding.eval()
+    
+    return gpt_core, embedding
+
+
+def extract_hidden_states(gpt_core, embedding, input_ids):
+    """
+    Extract final hidden states before the language modeling head.
+    
+    input_ids: (batch_size, seq_len)
+    returns: (hidden_states, token_embeddings)
+    """
+    with torch.no_grad():
+        # Get token-only embeddings (without positions)
+        tok_emb = embedding.token_only(input_ids)  # (B, T, n_embd)
+        
+        # Get full embeddings (with positions) for transformer
+        full_emb = embedding(input_ids)  # (B, T, n_embd)
+        
+        # Forward through transformer
+        hidden_states = gpt_core(full_emb)  # (B, T, n_embd)
+        
+        return hidden_states, tok_emb
+
+
+def generate_training_data(
+    gpt_core,
+    embedding,
+    dataset_path,
+    output_dir,
+    seq_length=128,
+    batch_size=32,
+    max_samples=100000,
+    device='cuda' if torch.cuda.is_available() else 'cpu'
+):
+    """
+    Generate training data pairs: (input_embeddings, hidden_states).
+    
+    Args:
+        gpt_core: Pretrained GPTCore model
+        embedding: Embedding module
+        dataset_path: Path to tokenized dataset (numpy memmap or similar)
+        output_dir: Where to save training data
+        seq_length: Sequence length for chunks
+        batch_size: Batch size for processing
+        max_samples: Maximum number of samples to generate
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    gpt_core = gpt_core.to(device)
+    embedding = embedding.to(device)
+    gpt_core.eval()
+    embedding.eval()
+    
+    # Load dataset
+    print(f"Loading dataset from {dataset_path}")
+    data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
+    
+    # Calculate number of chunks
+    n_chunks = min(len(data) // seq_length, max_samples)
+    print(f"Generating {n_chunks} training samples...")
+    
+    # Storage
+    all_input_embeddings = []
+    all_hidden_states = []
+    
+    # Generate samples in batches
+    for i in tqdm(range(0, n_chunks, batch_size)):
+        batch_end = min(i + batch_size, n_chunks)
+        actual_batch_size = batch_end - i
+        
+        # Extract batch of sequences
+        batch_sequences = []
+        for j in range(i, batch_end):
+            start_idx = j * seq_length
+            end_idx = start_idx + seq_length
+            
+            if end_idx > len(data):
+                break
+                
+            seq = data[start_idx:end_idx]
+            batch_sequences.append(seq)
+        
+        if not batch_sequences:
+            break
+            
+        # Convert to tensor
+        input_ids = torch.tensor(np.array(batch_sequences), dtype=torch.long, device=device)
+        
+        # Extract hidden states and input embeddings
+        hidden_states, input_embeddings = extract_hidden_states(gpt_core, embedding, input_ids)
+        
+        # Move to CPU and store (exclude last token's hidden state used for prediction)
+        all_input_embeddings.append(input_embeddings[:, :-1, :].cpu())
+        all_hidden_states.append(hidden_states[:, :-1, :].cpu())
+    
+    # Concatenate all batches
+    print("Concatenating batches...")
+    input_embeddings = torch.cat(all_input_embeddings, dim=0)
+    hidden_states = torch.cat(all_hidden_states, dim=0)
+    
+    print(f"Generated {input_embeddings.shape[0]} samples")
+    print(f"Input embeddings shape: {input_embeddings.shape}")
+    print(f"Hidden states shape: {hidden_states.shape}")
+    
+    # Save data
+    print("Saving training data...")
     torch.save({
-        'step': global_step,
-        'epoch': n_epochs,
-        'model_state_dict': encoder.state_dict(),
-        'config': config
-    }, final_path)
+        'input_embeddings': input_embeddings,
+        'hidden_states': hidden_states,
+        'seq_length': seq_length - 1,  # -1 because we exclude last token
+        'n_samples': input_embeddings.shape[0]
+    }, output_dir / 'training_data.pt')
     
-    # Save training log
-    with open(run_dir / 'data' / 'training_log.json', 'w') as f:
-        json.dump(training_log, f, indent=2)
+    # Save metadata
+    metadata = {
+        'seq_length': seq_length - 1,
+        'n_samples': int(input_embeddings.shape[0]),
+        'd_model': int(input_embeddings.shape[2]),
+        'dataset_path': str(dataset_path)
+    }
     
-    print(f"\nTraining complete. Saved to {run_dir}")
-    return encoder, run_dir
+    with open(output_dir / 'metadata.json', 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"Training data saved to {output_dir}")
+    
+    return input_embeddings, hidden_states
+
+
+def load_training_data(data_dir):
+    """Load pre-generated training data."""
+    data_dir = Path(data_dir)
+    
+    data = torch.load(data_dir / 'training_data.pt')
+    
+    with open(data_dir / 'metadata.json', 'r') as f:
+        metadata = json.load(f)
+    
+    return data['input_embeddings'], data['hidden_states'], metadata
+
+
+class SequenceEncoderDataset(torch.utils.data.Dataset):
+    """PyTorch Dataset for sequence encoder training."""
+    
+    def __init__(self, input_embeddings, hidden_states):
+        self.input_embeddings = input_embeddings
+        self.hidden_states = hidden_states
+        
+    def __len__(self):
+        return len(self.input_embeddings)
+    
+    def __getitem__(self, idx):
+        return {
+            'input_embeddings': self.input_embeddings[idx],
+            'hidden_states': self.hidden_states[idx]
+        }
 
 
 if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gpt_checkpoint', type=str, required=True, help='Path to GPT checkpoint')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to GPT checkpoint')
     parser.add_argument('--dataset_path', type=str, required=True, help='Path to tokenized dataset')
-    parser.add_argument('--output_dir', type=str, default='train/new')
-    parser.add_argument('--pregenerated_data', type=str, default=None, help='Optional pre-generated data dir')
-    
-    # Training params
-    parser.add_argument('--n_epochs', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--output_dir', type=str, default='data/encoder_training', help='Output directory')
+    parser.add_argument('--seq_length', type=int, default=128, help='Sequence length')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--max_samples', type=int, default=100000, help='Max samples to generate')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Data generation params
-    parser.add_argument('--seq_length', type=int, default=128)
-    parser.add_argument('--max_samples', type=int, default=100000)
-    parser.add_argument('--data_batch_size', type=int, default=32)
-    
-    # Loss weights
-    parser.add_argument('--contrastive_weight', type=float, default=1.0)
-    parser.add_argument('--variance_weight', type=float, default=0.1)
-    parser.add_argument('--repulsion_weight', type=float, default=0.5)
-    parser.add_argument('--repulsion_margin', type=float, default=0.1)
     
     args = parser.parse_args()
     
-    # Train
-    train_encoder(
-        gpt_checkpoint_path=args.gpt_checkpoint,
+    # Load model
+    print("Loading GPT model...")
+    gpt_core, embedding = load_gpt_model(args.model_path)
+    
+    # Generate training data
+    generate_training_data(
+        gpt_core=gpt_core,
+        embedding=embedding,
         dataset_path=args.dataset_path,
         output_dir=args.output_dir,
-        n_epochs=args.n_epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        device=args.device,
         seq_length=args.seq_length,
+        batch_size=args.batch_size,
         max_samples=args.max_samples,
-        data_batch_size=args.data_batch_size,
-        contrastive_weight=args.contrastive_weight,
-        variance_weight=args.variance_weight,
-        repulsion_weight=args.repulsion_weight,
-        repulsion_margin=args.repulsion_margin,
-        pregenerated_data_dir=args.pregenerated_data
+        device=args.device
     )
