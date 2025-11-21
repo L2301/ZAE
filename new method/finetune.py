@@ -37,8 +37,8 @@ def download_encoder_from_github(output_path='checkpoints/encoder_from_github.pt
 
 
 def download_joint_checkpoint_from_github(output_path='checkpoints/joint_from_github.pt'):
-    """Download GPT+decoder from chora-snapshot-64000 release."""
-    url = "https://github.com/L2301/ZAE/releases/download/chora-snapshot-64000/checkpoint_step_64000.pt"
+    """Download GPT+decoder from jointdon3.7ready4finetune release."""
+    url = "https://github.com/L2301/ZAE/releases/download/jointdon3.7ready4finetune/final_model.pt"
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -131,7 +131,7 @@ def finetune_encoder(
     log_interval=100,
     save_interval=1000,
     seq_length=4,
-    max_samples=1000000
+    max_samples=500000
 ):
     """Finetune encoder on LM loss."""
     
@@ -159,9 +159,9 @@ def finetune_encoder(
             enc_ckpt = torch.load(enc_path, map_location=device)
             encoder.load_state_dict(enc_ckpt['model_state_dict'])
     
-    # Load GPT and decoder from chora-snapshot-64000
+    # Load GPT and decoder from jointdon3.7ready4finetune
     if joint_checkpoint_path == 'github':
-        print("Downloading GPT+decoder from chora-snapshot-64000...")
+        print("Downloading GPT+decoder from jointdon3.7ready4finetune...")
         joint_path = download_joint_checkpoint_from_github()
         joint_checkpoint = torch.load(joint_path, map_location=device)
     else:
@@ -213,9 +213,9 @@ def finetune_encoder(
     
     # Optimizer for all three components with differential learning rates
     optimizer = torch.optim.AdamW([
-        {'params': encoder.parameters(), 'lr': learning_rate},  # Encoder learns fastest
+        {'params': encoder.parameters(), 'lr': learning_rate * 10},  # Encoder learns fastest
         {'params': gpt_core.parameters(), 'lr': learning_rate},
-        {'params': decoder.parameters(), 'lr': learning_rate}
+        {'params': decoder.parameters(), 'lr': learning_rate * 5}
     ], weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) * n_epochs)
     
@@ -351,7 +351,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--seq_length', type=int, default=4)
-    parser.add_argument('--max_samples', type=int, default=1000000)
+    parser.add_argument('--max_samples', type=int, default=500000)
     
     args = parser.parse_args()
     
