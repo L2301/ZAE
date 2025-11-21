@@ -168,7 +168,7 @@ def train_joint_ce(
     log_interval=100,
     save_interval=1000,
     seq_length=4,
-    max_samples=500000,
+    max_samples=1000000,
     router_weight=1.0,
     lm_weight=1.0
 ):
