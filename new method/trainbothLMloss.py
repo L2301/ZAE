@@ -166,7 +166,7 @@ def train_joint_ce(
     decoder_lr=1e-4,
     device='cuda' if torch.cuda.is_available() else 'cpu',
     log_interval=100,
-    save_interval=10000,
+    save_interval=100000,
     seq_length=4,
     max_samples=1000000,
     router_weight=1.0,
