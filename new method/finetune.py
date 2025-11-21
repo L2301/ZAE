@@ -174,12 +174,12 @@ def finetune_encoder(
     decoder = SequenceDecoder(d_model=768).to(device)
     decoder.load_state_dict(joint_checkpoint['decoder_state_dict'])
     
-    # Load embedding (frozen) - download GPT-2 if needed
+    # Load embedding (frozen) - always from GPT-2 HuggingFace
+    from model.tokenembedandun import Embedding
     from transformers import GPT2LMHeadModel
     print("Loading embedding from GPT-2...")
     hf_model = GPT2LMHeadModel.from_pretrained('gpt2')
     
-    from model.tokenembedandun import Embedding
     embedding = Embedding(vocab_size=50257, n_embd=768, block_size=1024).to(device)
     emb_sd = {
         'wte.weight': hf_model.transformer.wte.weight,
@@ -213,9 +213,9 @@ def finetune_encoder(
     
     # Optimizer for all three components with differential learning rates
     optimizer = torch.optim.AdamW([
-        {'params': encoder.parameters(), 'lr': learning_rate * 10},  # Encoder learns fastest
+        {'params': encoder.parameters(), 'lr': learning_rate},  # Encoder learns fastest
         {'params': gpt_core.parameters(), 'lr': learning_rate},
-        {'params': decoder.parameters(), 'lr': learning_rate * 5}
+        {'params': decoder.parameters(), 'lr': learning_rate}
     ], weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) * n_epochs)
     
@@ -351,7 +351,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--seq_length', type=int, default=4)
-    parser.add_argument('--max_samples', type=int, default=500000)
+    parser.add_argument('--max_samples', type=int, default=1000000)
     
     args = parser.parse_args()
     
