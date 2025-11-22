@@ -22,7 +22,7 @@ from decoder import SequenceDecoder
 from model.modelcore import GPTCore
 from model.tokenembedandun import Embedding
 from model.lmhead import LMHead
-from coherence import CoherenceAttention
+from coherence_single_head import CoherenceAttention
 
 
 def load_pretrained_gpt2():
