@@ -231,7 +231,7 @@ class SequenceEncoderDataset(torch.utils.data.Dataset):
         dataset_path = Path(dataset_path) if dataset_path else None
         if dataset_path is None or not dataset_path.exists():
             print("No dataset provided, downloading wikitext-103...")
-            dataset_path = Path(download_and_tokenize_openwebtext())
+            dataset_path = Path(download_and_tokenize_c4())
         
         self.data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
         
