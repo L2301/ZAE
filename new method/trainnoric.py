@@ -22,7 +22,7 @@ from decoder import SequenceDecoder
 from model.modelcore import GPTCore
 from model.tokenembedandun import Embedding
 from model.lmhead import LMHead
-from coherence import CoherenceAttention
+from coherence_single_head import CoherenceAttention
 
 
 def load_pretrained_gpt2():
@@ -175,11 +175,10 @@ def variable_context_collate_fn(batch):
     context_lengths = torch.tensor([item['context_length'] for item in batch])
     
     # Pad contexts to max length in batch
-    # pad_sequence expects (seq_len, batch, features) but we have (batch, seq_len, features)
-    # So we need to transpose
-    contexts_transposed = [ctx.transpose(0, 1) for ctx in contexts]  # Each: (768, seq_len)
-    padded_contexts = pad_sequence(contexts_transposed, batch_first=False, padding_value=0.0)
-    padded_contexts = padded_contexts.transpose(0, 1).transpose(1, 2)  # (batch, seq_len, 768)
+    # pad_sequence expects list of tensors with shape (seq_len, features)
+    # Our contexts are (seq_len, 768), which is correct
+    padded_contexts = pad_sequence(contexts, batch_first=True, padding_value=0.0)
+    # Result is (batch, max_seq_len, 768)
     
     # Create attention mask (1 for real tokens, 0 for padding)
     max_len = padded_contexts.size(1)
