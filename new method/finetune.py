@@ -126,12 +126,12 @@ def finetune_encoder(
     output_dir='train/encoder_finetune',
     n_epochs=5,
     batch_size=32,
-    learning_rate=1e-5,
+    learning_rate=5e-6,
     device='cuda' if torch.cuda.is_available() else 'cpu',
     log_interval=100,
-    save_interval=1000,
+    save_interval=10000,
     seq_length=4,
-    max_samples=500000
+    max_samples=1000000
 ):
     """Finetune encoder on LM loss."""
     
