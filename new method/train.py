@@ -14,7 +14,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from encoder import SequenceEncoder
 from data import (
     SequenceEncoderDataset, 
-    download_and_tokenize_wikitext
+    download_and_tokenize_openwebtext
 )
 
 

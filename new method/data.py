@@ -9,6 +9,53 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 
+def download_and_tokenize_openwebtext(output_path='data/openwebtext.bin', max_samples=None):
+    """Download and tokenize OpenWebText dataset.
+    
+    Args:
+        output_path: Where to save the tokenized data
+        max_samples: Maximum number of samples to process (None = all)
+    
+    Returns:
+        Path to the tokenized binary file
+    """
+    from datasets import load_dataset
+    from transformers import GPT2TokenizerFast
+    from pathlib import Path
+    import numpy as np
+    from tqdm import tqdm
+    
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    if output_path.exists():
+        print(f"Using cached OpenWebText at {output_path}")
+        return str(output_path)
+    
+    print("Downloading OpenWebText...")
+    dataset = load_dataset('Skylion007/openwebtext', split='train', streaming=False)
+    
+    if max_samples:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
+    
+    print(f"Tokenizing {len(dataset)} samples...")
+    tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
+    
+    all_tokens = []
+    for example in tqdm(dataset):
+        tokens = tokenizer.encode(example['text'], add_special_tokens=False)
+        all_tokens.extend(tokens)
+    
+    # Convert to numpy array and save
+    tokens_array = np.array(all_tokens, dtype=np.uint16)
+    print(f"Saving {len(tokens_array)} tokens to {output_path}")
+    
+    with open(output_path, 'wb') as f:
+        tokens_array.tofile(f)
+    
+    return str(output_path)
+
+
 def download_and_tokenize_wikitext(output_path='data/wikitext.bin', split='train'):
     """Download and tokenize wikitext-103."""
     from datasets import load_dataset
@@ -172,7 +219,7 @@ class SequenceEncoderDataset(torch.utils.data.Dataset):
         dataset_path = Path(dataset_path) if dataset_path else None
         if dataset_path is None or not dataset_path.exists():
             print("No dataset provided, downloading wikitext-103...")
-            dataset_path = Path(download_and_tokenize_wikitext())
+            dataset_path = Path(download_and_tokenize_openwebtext())
         
         self.data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
         
