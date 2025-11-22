@@ -1,12 +1,13 @@
 """
-Train full ZAE system from scratch - Only GPT-2 embedding and modelcore are pretrained
-Trains to predict NEXT 4 tokens from compressed current 4 tokens
+Train full ZAE system from scratch with PROPER autoregressive context
+Multiple compressed sequences through GPT to predict next sequence
+SUPPORTS VARIABLE CONTEXT LENGTHS for more robust training
 """
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.nn.utils.rnn import pad_sequence
 from pathlib import Path
 import json
 from tqdm import tqdm
@@ -16,13 +17,12 @@ import sys
 import numpy as np
 
 sys.path.append(str(Path(__file__).parent.parent))
-
 from encoder import SequenceEncoder
 from decoder import SequenceDecoder
 from model.modelcore import GPTCore
 from model.tokenembedandun import Embedding
 from model.lmhead import LMHead
-from coherence import CoherenceAttention
+from coherence_single_head import CoherenceAttention
 
 
 def load_pretrained_gpt2():
@@ -67,16 +67,31 @@ def load_pretrained_gpt2():
     return gpt_core, embedding
 
 
-class NextSequencePredictionDataset(Dataset):
-    """Dataset for training to predict NEXT sequence from current sequence."""
+class VariableContextDataset(Dataset):
+    """Dataset that provides VARIABLE context of N compressed sequences to predict sequence N+1.
     
-    def __init__(self, encoder, embedding, dataset_path, seq_length=4, max_samples=10000000, device='cpu'):
+    Each sample can have a different context length between min_context and max_context.
+    This creates more robust training by exposing the model to varying amounts of context.
+    
+    Flow:
+    chunks [0,1,2,...,N-1] → encoder → [<seq0>, <seq1>, ..., <seqN-1>]
+    → GPT → [<seq0>, <seq1>, ..., <seqN-1>, <pred_seqN>]
+    → decoder(<pred_seqN>) → chunk_N tokens
+    
+    where N varies per sample from min_context to max_context
+    """
+    
+    def __init__(self, encoder, embedding, dataset_path, 
+                 chunk_size=4, min_context=2, max_context=16, 
+                 max_samples=1000000, device='cpu'):
         self.encoder = encoder.to(device)
         self.embedding = embedding.to(device)
         self.encoder.eval()
         self.embedding.eval()
         self.device = device
-        self.seq_length = seq_length
+        self.chunk_size = chunk_size
+        self.min_context = min_context
+        self.max_context = max_context
         
         for param in self.encoder.parameters():
             param.requires_grad = False
@@ -89,36 +104,99 @@ class NextSequencePredictionDataset(Dataset):
             dataset_path = Path(download_and_tokenize_c4())
         
         self.data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
-        self.n_samples = min(len(self.data) // (seq_length * 2), max_samples)
+        # Need max_context + 1 chunks per sample (max context + target)
+        total_tokens_needed = (max_context + 1) * chunk_size
+        self.n_samples = min(len(self.data) // total_tokens_needed, max_samples)
+        
+        print(f"Dataset initialized: {self.n_samples} samples")
+        print(f"Context range: {min_context}-{max_context} chunks of {chunk_size} tokens")
     
     def __len__(self):
         return self.n_samples
     
     def __getitem__(self, idx):
-        """Generate training example: current sequence -> next sequence."""
-        start_idx = idx * self.seq_length * 2
+        """Generate training example with VARIABLE context length.
         
-        # Current sequence (input)
-        seq1 = self.data[start_idx:start_idx + self.seq_length]
-        input_ids = torch.tensor(seq1, dtype=torch.long, device=self.device)
+        Returns:
+            compressed_context: (variable_context_length, 768) - encoded context chunks
+            target_chunk: (chunk_size,) - next chunk tokens to predict
+            context_length: int - actual context length for this sample
+        """
+        # Randomly choose context length for this sample
+        context_length = torch.randint(self.min_context, self.max_context + 1, (1,)).item()
         
-        # Next sequence (target)
-        seq2 = self.data[start_idx + self.seq_length:start_idx + self.seq_length * 2]
-        target_ids = torch.tensor(seq2, dtype=torch.long, device=self.device)
+        start_idx = idx * (self.max_context + 1) * self.chunk_size
         
-        with torch.no_grad():
-            # Encode current sequence
-            tok_emb = self.embedding.token_only(input_ids.unsqueeze(0))
-            compressed = self.encoder(tok_emb).squeeze(0)
+        compressed_chunks = []
+        
+        # Encode context chunks
+        for i in range(context_length):
+            chunk_start = start_idx + i * self.chunk_size
+            chunk_end = chunk_start + self.chunk_size
+            chunk_tokens = self.data[chunk_start:chunk_end]
+            chunk_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=self.device)
+            
+            with torch.no_grad():
+                tok_emb = self.embedding.token_only(chunk_ids.unsqueeze(0))
+                compressed = self.encoder(tok_emb).squeeze(0)  # (768,)
+            
+            compressed_chunks.append(compressed)
+        
+        # Get target chunk (chunk that follows context)
+        target_start = start_idx + context_length * self.chunk_size
+        target_end = target_start + self.chunk_size
+        target_tokens = self.data[target_start:target_end]
+        target_ids = torch.tensor(target_tokens, dtype=torch.long, device=self.device)
+        
+        # Stack compressed chunks
+        compressed_context = torch.stack(compressed_chunks)  # (context_length, 768)
         
         return {
-            'compressed': compressed.cpu(),
-            'target_ids': target_ids.cpu()
+            'compressed_context': compressed_context.cpu(),
+            'target_ids': target_ids.cpu(),
+            'context_length': context_length
         }
 
 
-def train_full_system_scratch(
-    output_dir='train/full_system_scratch',
+def variable_context_collate_fn(batch):
+    """Custom collate function to handle variable-length contexts.
+    
+    Pads sequences to the longest in the batch and creates attention masks.
+    
+    Args:
+        batch: List of dicts with 'compressed_context', 'target_ids', 'context_length'
+    
+    Returns:
+        dict with padded tensors and attention masks
+    """
+    # Extract contexts and targets
+    contexts = [item['compressed_context'] for item in batch]
+    targets = torch.stack([item['target_ids'] for item in batch])
+    context_lengths = torch.tensor([item['context_length'] for item in batch])
+    
+    # Pad contexts to max length in batch
+    # pad_sequence expects (seq_len, batch, features) but we have (batch, seq_len, features)
+    # So we need to transpose
+    contexts_transposed = [ctx.transpose(0, 1) for ctx in contexts]  # Each: (768, seq_len)
+    padded_contexts = pad_sequence(contexts_transposed, batch_first=False, padding_value=0.0)
+    padded_contexts = padded_contexts.transpose(0, 1).transpose(1, 2)  # (batch, seq_len, 768)
+    
+    # Create attention mask (1 for real tokens, 0 for padding)
+    max_len = padded_contexts.size(1)
+    attention_mask = torch.zeros(len(batch), max_len, dtype=torch.bool)
+    for i, length in enumerate(context_lengths):
+        attention_mask[i, :length] = 1
+    
+    return {
+        'compressed_context': padded_contexts,
+        'target_ids': targets,
+        'attention_mask': attention_mask,
+        'context_lengths': context_lengths
+    }
+
+
+def train_autoregressive_system(
+    output_dir='train/autoregressive_variable',
     dataset_path=None,
     n_epochs=20,
     batch_size=32,
@@ -128,14 +206,16 @@ def train_full_system_scratch(
     coherence_lr=1e-4,
     device='cuda' if torch.cuda.is_available() else 'cpu',
     log_interval=100,
-    save_interval=100000,
-    seq_length=4,
-    max_samples=10000000,
+    save_interval=10000,
+    chunk_size=4,
+    min_context=2,
+    max_context=16,
+    max_samples=1000000,
     use_coherence=True
 ):
-    """Train full system from scratch (except GPT-2 embedding/modelcore)."""
+    """Train full system with VARIABLE autoregressive context lengths."""
     
-    run_id = f"scratch_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    run_id = f"varctx_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     run_dir = Path(output_dir) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / 'data').mkdir(exist_ok=True)
@@ -169,12 +249,14 @@ def train_full_system_scratch(
     lm_head = LMHead.from_pretrained_gpt2('gpt2').to(device)
     
     # Create dataset
-    print("Creating dataset...")
-    dataset = NextSequencePredictionDataset(
+    print("Creating variable context dataset...")
+    dataset = VariableContextDataset(
         encoder=encoder,
         embedding=embedding,
         dataset_path=dataset_path,
-        seq_length=seq_length,
+        chunk_size=chunk_size,
+        min_context=min_context,
+        max_context=max_context,
         max_samples=max_samples,
         device=device
     )
@@ -184,7 +266,8 @@ def train_full_system_scratch(
         batch_size=batch_size,
         shuffle=True,
         num_workers=0,
-        pin_memory=False
+        pin_memory=False,
+        collate_fn=variable_context_collate_fn
     )
     
     # Optimizer - train everything except embedding
@@ -202,6 +285,7 @@ def train_full_system_scratch(
     config = {
         'run_id': run_id,
         'pretrained': False,
+        'variable_context': True,
         'dataset_path': str(dataset_path) if dataset_path else 'auto-downloaded',
         'n_epochs': n_epochs,
         'batch_size': batch_size,
@@ -209,7 +293,9 @@ def train_full_system_scratch(
         'gpt_lr': gpt_lr,
         'decoder_lr': decoder_lr,
         'coherence_lr': coherence_lr if coherence else None,
-        'seq_length': seq_length,
+        'chunk_size': chunk_size,
+        'min_context': min_context,
+        'max_context': max_context,
         'max_samples': max_samples,
         'use_coherence': use_coherence,
         'total_samples': len(dataset)
@@ -218,9 +304,13 @@ def train_full_system_scratch(
     with open(run_dir / 'data' / 'config.json', 'w') as f:
         json.dump(config, f, indent=2)
     
-    print(f"Training from scratch on {len(dataset)} samples for {n_epochs} epochs")
+    print(f"\nTraining autoregressive system with VARIABLE context")
     print(f"Run ID: {run_id}")
-    print(f"Task: Predict NEXT {seq_length} tokens from current {seq_length} tokens")
+    print(f"Total samples: {len(dataset)}")
+    print(f"Epochs: {n_epochs}")
+    print(f"Batch size: {batch_size}")
+    print(f"Context range: {min_context}-{max_context} chunks of {chunk_size} tokens each")
+    print(f"Task: Given [<seq0>, <seq1>, ..., <seqN>] → predict <seq(N+1)> where N varies\n")
     
     # Training loop
     encoder.train()
@@ -231,6 +321,7 @@ def train_full_system_scratch(
     
     global_step = 0
     training_log = []
+    context_length_stats = {i: 0 for i in range(min_context, max_context + 1)}
     
     for epoch in range(n_epochs):
         epoch_loss = 0
@@ -238,22 +329,36 @@ def train_full_system_scratch(
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{n_epochs}")
         for batch in pbar:
-            compressed = batch['compressed'].to(device)  # (B, 768)
-            target_ids = batch['target_ids'].to(device)  # (B, seq_length)
+            compressed_context = batch['compressed_context'].to(device)  # (B, max_seq_len, 768)
+            target_ids = batch['target_ids'].to(device)  # (B, chunk_size)
+            attention_mask = batch['attention_mask'].to(device)  # (B, max_seq_len)
+            context_lengths = batch['context_lengths']
             
-            # Forward: compressed -> GPT -> decoder -> next sequence
-            compressed_unsqueezed = compressed.unsqueeze(1)  # (B, 1, 768)
-            gpt_hidden = gpt_core(compressed_unsqueezed).squeeze(1)  # (B, 768)
+            # Track context length distribution
+            for length in context_lengths.tolist():
+                context_length_stats[length] += 1
             
-            # Decode to next sequence
-            reconstructed = decoder(gpt_hidden, target_seq_len=seq_length)  # (B, seq_length, 768)
+            # Forward: context through GPT with attention mask
+            # GPT processes sequence of compressed vectors
+            gpt_output = gpt_core(compressed_context)  # (B, max_seq_len, 768)
+            
+            # Extract the last valid position for each sequence in batch
+            # For each sample, get output at position (context_length - 1)
+            batch_size = gpt_output.size(0)
+            predicted_next = torch.zeros(batch_size, 768, device=device)
+            for i in range(batch_size):
+                last_pos = context_lengths[i] - 1
+                predicted_next[i] = gpt_output[i, last_pos, :]
+            
+            # Decode predicted next sequence vector
+            reconstructed = decoder(predicted_next, target_seq_len=chunk_size)  # (B, chunk_size, 768)
             
             # Optional coherence attention
             if coherence:
                 reconstructed = coherence(reconstructed)
             
             # Predict tokens
-            pred_logits = lm_head(reconstructed)  # (B, seq_length, vocab_size)
+            pred_logits = lm_head(reconstructed)  # (B, chunk_size, vocab_size)
             
             # Loss
             loss = F.cross_entropy(
@@ -278,9 +383,13 @@ def train_full_system_scratch(
             epoch_loss += loss.item()
             epoch_acc += acc.item()
             
+            # Show stats including context length range in this batch
+            min_ctx = context_lengths.min().item()
+            max_ctx = context_lengths.max().item()
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
-                'acc': f"{acc.item():.3f}"
+                'acc': f"{acc.item():.3f}",
+                'ctx': f"{min_ctx}-{max_ctx}"
             })
             
             if global_step % log_interval == 0:
@@ -289,7 +398,10 @@ def train_full_system_scratch(
                     'epoch': epoch,
                     'loss': loss.item(),
                     'accuracy': acc.item(),
-                    'lr': scheduler.get_last_lr()[0]
+                    'lr': scheduler.get_last_lr()[0],
+                    'batch_min_context': min_ctx,
+                    'batch_max_context': max_ctx,
+                    'batch_avg_context': context_lengths.float().mean().item()
                 })
             
             if global_step % save_interval == 0 and global_step > 0:
@@ -315,6 +427,15 @@ def train_full_system_scratch(
         print(f"\nEpoch {epoch+1} Summary:")
         print(f"  Loss: {epoch_loss/n_batches:.4f}")
         print(f"  Accuracy: {epoch_acc/n_batches:.3f}")
+        
+        # Show context length distribution for this epoch
+        if (epoch + 1) % 5 == 0:
+            print(f"  Context length distribution:")
+            total_samples = sum(context_length_stats.values())
+            for ctx_len in range(min_context, max_context + 1):
+                count = context_length_stats[ctx_len]
+                pct = 100 * count / total_samples if total_samples > 0 else 0
+                print(f"    {ctx_len} chunks: {count} samples ({pct:.1f}%)")
     
     # Save final
     final_path = run_dir / 'model' / 'final_model.pt'
@@ -324,7 +445,8 @@ def train_full_system_scratch(
         'encoder_state_dict': encoder.state_dict(),
         'gpt_core_state_dict': gpt_core.state_dict(),
         'decoder_state_dict': decoder.state_dict(),
-        'config': config
+        'config': config,
+        'context_length_stats': context_length_stats
     }
     if coherence:
         save_dict['coherence_state_dict'] = coherence.state_dict()
@@ -333,30 +455,64 @@ def train_full_system_scratch(
     with open(run_dir / 'data' / 'training_log.json', 'w') as f:
         json.dump(training_log, f, indent=2)
     
-    print(f"\nTraining complete. Saved to {run_dir}")
+    # Save context length statistics
+    with open(run_dir / 'data' / 'context_length_stats.json', 'w') as f:
+        json.dump(context_length_stats, f, indent=2)
+    
+    print(f"\n{'='*60}")
+    print(f"Training complete!")
+    print(f"Saved to: {run_dir}")
+    print(f"\nFinal context length distribution:")
+    total_samples = sum(context_length_stats.values())
+    for ctx_len in range(min_context, max_context + 1):
+        count = context_length_stats[ctx_len]
+        pct = 100 * count / total_samples if total_samples > 0 else 0
+        print(f"  {ctx_len} chunks: {count} samples ({pct:.1f}%)")
+    print(f"{'='*60}\n")
+    
     return encoder, gpt_core, decoder, coherence, run_dir
 
 
 if __name__ == '__main__':
     import argparse
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_path', type=str, default=None)
-    parser.add_argument('--output_dir', type=str, default='train/full_system_scratch')
-    parser.add_argument('--n_epochs', type=int, default=20)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--encoder_lr', type=float, default=1e-4)
-    parser.add_argument('--gpt_lr', type=float, default=5e-5)
-    parser.add_argument('--decoder_lr', type=float, default=1e-4)
-    parser.add_argument('--coherence_lr', type=float, default=1e-4)
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--seq_length', type=int, default=4)
-    parser.add_argument('--max_samples', type=int, default=1000000)
-    parser.add_argument('--no_coherence', action='store_true', help='Disable coherence attention')
+    parser = argparse.ArgumentParser(description='Train ZAE with variable context lengths')
+    parser.add_argument('--dataset_path', type=str, default=None,
+                        help='Path to tokenized dataset')
+    parser.add_argument('--output_dir', type=str, default='train/autoregressive_variable',
+                        help='Output directory for training runs')
+    parser.add_argument('--n_epochs', type=int, default=20,
+                        help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size')
+    parser.add_argument('--encoder_lr', type=float, default=1e-4,
+                        help='Learning rate for encoder')
+    parser.add_argument('--gpt_lr', type=float, default=5e-5,
+                        help='Learning rate for GPT core')
+    parser.add_argument('--decoder_lr', type=float, default=1e-4,
+                        help='Learning rate for decoder')
+    parser.add_argument('--coherence_lr', type=float, default=1e-4,
+                        help='Learning rate for coherence attention')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
+                        help='Device to train on')
+    parser.add_argument('--chunk_size', type=int, default=4,
+                        help='Number of tokens per chunk')
+    parser.add_argument('--min_context', type=int, default=2,
+                        help='Minimum number of context chunks')
+    parser.add_argument('--max_context', type=int, default=16,
+                        help='Maximum number of context chunks')
+    parser.add_argument('--max_samples', type=int, default=1000000,
+                        help='Maximum number of samples to use')
+    parser.add_argument('--no_coherence', action='store_true',
+                        help='Disable coherence attention')
+    parser.add_argument('--log_interval', type=int, default=100,
+                        help='Steps between logging')
+    parser.add_argument('--save_interval', type=int, default=10000,
+                        help='Steps between saving checkpoints')
     
     args = parser.parse_args()
     
-    train_full_system_scratch(
+    train_autoregressive_system(
         output_dir=args.output_dir,
         dataset_path=args.dataset_path,
         n_epochs=args.n_epochs,
@@ -366,7 +522,11 @@ if __name__ == '__main__':
         decoder_lr=args.decoder_lr,
         coherence_lr=args.coherence_lr,
         device=args.device,
-        seq_length=args.seq_length,
+        chunk_size=args.chunk_size,
+        min_context=args.min_context,
+        max_context=args.max_context,
         max_samples=args.max_samples,
-        use_coherence=not args.no_coherence
+        use_coherence=not args.no_coherence,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval
     )
