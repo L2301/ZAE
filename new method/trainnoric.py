@@ -93,10 +93,6 @@ class VariableContextDataset(Dataset):
         self.min_context = min_context
         self.max_context = max_context
         
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        for param in self.embedding.parameters():
-            param.requires_grad = False
         
         # Load dataset
         if dataset_path is None or not Path(dataset_path).exists():
