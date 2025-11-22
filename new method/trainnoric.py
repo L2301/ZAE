@@ -68,10 +68,9 @@ def load_pretrained_gpt2():
 
 
 class VariableContextDataset(Dataset):
-    """Dataset that provides VARIABLE context with ON-THE-FLY encoding.
+    """Dataset that encodes half at a time to reduce memory and startup time.
     
-    Encodes first half of epoch, then switches to second half while first half trains.
-    This allows streaming encoding without storing everything in memory.
+    Encodes first half initially, then switches to second half when accessed.
     """
     
     def __init__(self, encoder, embedding, dataset_path, 
@@ -95,7 +94,7 @@ class VariableContextDataset(Dataset):
         
         # Pre-encoded cache for current half
         self.cache = {}
-        self.cache_half = 0  # 0 or 1
+        self.cache_half = None
         self.samples_per_half = self.n_samples // 2
         
         print(f"Dataset initialized: {self.n_samples} samples")
@@ -105,9 +104,12 @@ class VariableContextDataset(Dataset):
     def __len__(self):
         return self.n_samples
     
-    def _encode_half(self, half_idx):
-        """Pre-encode half of the dataset."""
-        print(f"\nPre-encoding half {half_idx+1}/2...")
+    def encode_half(self, half_idx):
+        """Pre-encode half of the dataset. Call this from main training loop."""
+        print(f"\n{'='*60}")
+        print(f"Encoding half {half_idx+1}/2 of dataset...")
+        print(f"{'='*60}")
+        
         self.encoder.eval()
         self.embedding.eval()
         self.encoder.to(self.device)
@@ -149,15 +151,12 @@ class VariableContextDataset(Dataset):
         
         self.cache_half = half_idx
         print(f"Encoded {len(self.cache)} samples for half {half_idx+1}")
+        print(f"{'='*60}\n")
     
     def __getitem__(self, idx):
-        """Return pre-encoded sample, triggering re-encode if needed."""
-        half_idx = 0 if idx < self.samples_per_half else 1
-        
-        # Switch halves if needed
-        if half_idx != self.cache_half:
-            self._encode_half(half_idx)
-        
+        """Return pre-encoded sample."""
+        if idx not in self.cache:
+            raise RuntimeError(f"Sample {idx} not in cache. Current half: {self.cache_half}")
         return self.cache[idx]
 
 
@@ -269,18 +268,16 @@ def train_autoregressive_system(
         device=device
     )
     
-    # Pre-encode first half before training starts
-    dataset._encode_half(0)
+    # Encode first half before training
+    dataset.encode_half(0)
     
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
+        shuffle=False,  # Don't shuffle to maintain half boundaries
+        num_workers=0,
         pin_memory=True,
-        collate_fn=variable_context_collate_fn,
-        persistent_workers=True,
-        prefetch_factor=2
+        collate_fn=variable_context_collate_fn
     )
     
     # Optimizer - train everything except embedding
@@ -341,8 +338,19 @@ def train_autoregressive_system(
         epoch_loss = 0
         epoch_acc = 0
         
+        # Encode first half at start of epoch
+        if epoch > 0:  # Already encoded for epoch 0
+            dataset.encode_half(0)
+        
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{n_epochs}")
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            # Switch to second half at midpoint
+            if batch_idx == len(dataloader) // 2 and dataset.cache_half == 0:
+                print("\n\nReached epoch midpoint - encoding second half...")
+                # Put encoder back in training mode after encoding
+                dataset.encode_half(1)
+                encoder.train()
+                
             compressed_context = batch['compressed_context'].to(device)  # (B, max_seq_len, 768)
             target_ids = batch['target_ids'].to(device)  # (B, max_seq_len, chunk_size)
             attention_mask = batch['attention_mask'].to(device)  # (B, max_seq_len)
