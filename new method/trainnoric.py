@@ -338,7 +338,7 @@ def train_autoregressive_system(
             # Forward: context through GPT with attention mask
             # GPT processes sequence of compressed vectors
             gpt_output = gpt_core(compressed_context)  # (B, max_seq_len, 768)
-            for i in range(context_length):
+            for i in range(context_lengths):
                 pred_next = gpt_output[:, i, :]  # Position i predicts i+1
                 target_chunk = target_ids[:, i] # chunk i+1
                 reconstructed = decoder(pred_next)
