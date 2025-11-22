@@ -92,7 +92,9 @@ class VariableContextDataset(Dataset):
         self.chunk_size = chunk_size
         self.min_context = min_context
         self.max_context = max_context
-        
+    
+        for param in self.embedding.parameters():
+            param.requires_grad = False
         
         # Load dataset
         if dataset_path is None or not Path(dataset_path).exists():
@@ -132,9 +134,9 @@ class VariableContextDataset(Dataset):
             chunk_tokens = self.data[chunk_start:chunk_end]
             chunk_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=self.device)
             
-            
-            tok_emb = self.embedding.token_only(chunk_ids.unsqueeze(0))
-            compressed = self.encoder(tok_emb).squeeze(0)  # (768,)
+            with torch.no_grad():
+                tok_emb = self.embedding.token_only(chunk_ids.unsqueeze(0))
+                compressed = self.encoder(tok_emb).squeeze(0)  # (768,)
             
             compressed_chunks.append(compressed)
         
@@ -373,14 +375,6 @@ def train_autoregressive_system(
             if coherence:
                 torch.nn.utils.clip_grad_norm_(coherence.parameters(), 1.0)
             optimizer.step()
-            # Print gradient norms
-            enc_grad = torch.nn.utils.clip_grad_norm_(encoder.parameters(), float('inf'))
-            gpt_grad = torch.nn.utils.clip_grad_norm_(gpt_core.parameters(), float('inf'))
-            dec_grad = torch.nn.utils.clip_grad_norm_(decoder.parameters(), float('inf'))
-
-            if global_step % 100 == 0:
-                print(f"\nGrad norms - Enc: {enc_grad:.4f}, GPT: {gpt_grad:.4f}, Dec: {dec_grad:.4f}")
-            
             scheduler.step()
             
             epoch_loss += loss.item()
