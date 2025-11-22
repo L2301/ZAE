@@ -111,13 +111,12 @@ class VariableContextDataset(Dataset):
     
     def __len__(self):
         return self.n_samples
-    
     def __getitem__(self, idx):
         """Generate training example with VARIABLE context length.
         
         Returns:
             compressed_context: (variable_context_length, 768) - encoded context chunks
-            target_chunk: (chunk_size,) - next chunk tokens to predict
+            all_target_ids: (variable_context_length, chunk_size) - ALL chunks for autoregressive training
             context_length: int - actual context length for this sample
         """
         # Randomly choose context length for this sample
@@ -126,35 +125,32 @@ class VariableContextDataset(Dataset):
         start_idx = idx * (self.max_context + 1) * self.chunk_size
         
         compressed_chunks = []
+        all_target_chunks = []
         
-        # Encode context chunks
+        # Encode ALL chunks (we need them as targets for autoregressive training)
         for i in range(context_length):
             chunk_start = start_idx + i * self.chunk_size
             chunk_end = chunk_start + self.chunk_size
             chunk_tokens = self.data[chunk_start:chunk_end]
             chunk_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=self.device)
             
+            # Compress for input
             with torch.no_grad():
                 tok_emb = self.embedding.token_only(chunk_ids.unsqueeze(0))
                 compressed = self.encoder(tok_emb).squeeze(0)  # (768,)
             
             compressed_chunks.append(compressed)
+            all_target_chunks.append(chunk_ids)
         
-        # Get target chunk (chunk that follows context)
-        target_start = start_idx + context_length * self.chunk_size
-        target_end = target_start + self.chunk_size
-        target_tokens = self.data[target_start:target_end]
-        target_ids = torch.tensor(target_tokens, dtype=torch.long, device=self.device)
-        
-        # Stack compressed chunks
+        # Stack
         compressed_context = torch.stack(compressed_chunks)  # (context_length, 768)
+        all_target_ids = torch.stack(all_target_chunks)  # (context_length, chunk_size)
         
         return {
             'compressed_context': compressed_context.cpu(),
-            'target_ids': target_ids.cpu(),
+            'all_target_ids': all_target_ids.cpu(),
             'context_length': context_length
         }
-
 
 def variable_context_collate_fn(batch):
     """Custom collate function to handle variable-length contexts.
@@ -169,7 +165,8 @@ def variable_context_collate_fn(batch):
     """
     # Extract contexts and targets
     contexts = [item['compressed_context'] for item in batch]
-    targets = torch.stack([item['target_ids'] for item in batch])
+    targets = [item['all_target_ids'] for item in batch]  # List of variable-length tensors
+    padded_targets = pad_sequence(targets, batch_first=True, padding_value=-100)  # (B, max_len, chunk_size)
     context_lengths = torch.tensor([item['context_length'] for item in batch])
     
     # Pad contexts to max length in batch
@@ -338,39 +335,25 @@ def train_autoregressive_system(
             # Forward: context through GPT with attention mask
             # GPT processes sequence of compressed vectors
             gpt_output = gpt_core(compressed_context)  # (B, max_seq_len, 768)
-            for i in range(context_lengths):
-                pred_next = gpt_output[:, i, :]  # Position i predicts i+1
-                target_chunk = target_ids[:, i] # chunk i+1
-                reconstructed = decoder(pred_next)
-                loss += F.cross_entropy(reconstructed, target_chunk)
-            
-            # Extract the last valid position for each sequence in batch
-            # For each sample, get output at position (context_length - 1)
-            batch_size = gpt_output.size(0)
-            predicted_next = torch.zeros(batch_size, 768, device=device)
+            loss = 0
+            num_predictions = 0
             for i in range(batch_size):
-                last_pos = context_lengths[i] - 1
-                predicted_next[i] = gpt_output[i, last_pos, :]
+                seq_len = context_lengths[i].item()
+                # Train on positions 0 to seq_len-2 (each predicts next)
+                for pos in range(seq_len - 1):
+                    pred_vector = gpt_output[i, pos, :]  # (768,)
+                    reconstructed = decoder(pred_vector.unsqueeze(0), target_seq_len=chunk_size)
+                    if coherence:
+                        reconstructed = coherence(reconstructed)
+                    pred_logits = lm_head(reconstructed)  # (1, chunk_size, vocab_size)
+                    
+                    # Target is chunk at position pos+1
+                    target = padded_targets[i, pos+1, :]  # (chunk_size,)
+                    loss += F.cross_entropy(pred_logits.squeeze(0), target)
+                    num_predictions += 1
             
-            # Decode predicted next sequence vector
-            reconstructed = decoder(predicted_next, target_seq_len=chunk_size)  # (B, chunk_size, 768)
-            
-            # Optional coherence attention
-            if coherence:
-                reconstructed = coherence(reconstructed)
-            
-            # Predict tokens
-            pred_logits = lm_head(reconstructed)  # (B, chunk_size, vocab_size)
-            
-            # Loss
-            loss = F.cross_entropy(
-                pred_logits.reshape(-1, pred_logits.size(-1)),
-                target_ids.reshape(-1)
-            )
-            
-            # Accuracy
-            preds = pred_logits.argmax(dim=-1)
-            acc = (preds == target_ids).float().mean()
+            acc = num_predictions / (batch_size * (context_lengths.max().item() - 1))
+            loss = loss / num_predictions
             
             optimizer.zero_grad()
             loss.backward()
