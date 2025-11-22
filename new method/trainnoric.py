@@ -343,7 +343,7 @@ def train_autoregressive_system(
                 context_length_stats[length] += 1
             
             # Forward pass with mixed precision
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 # Forward: context through GPT with attention mask
                 gpt_output = gpt_core(compressed_context)  # (B, max_seq_len, 768)
                 
