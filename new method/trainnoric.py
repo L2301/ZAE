@@ -200,7 +200,7 @@ def train_autoregressive_system(
     output_dir='train/autoregressive_variable',
     dataset_path=None,
     n_epochs=20,
-    batch_size=32,
+    batch_size=64,
     encoder_lr=1e-4,
     gpt_lr=5e-5,
     decoder_lr=1e-4,
@@ -282,6 +282,7 @@ def train_autoregressive_system(
     
     optimizer = torch.optim.AdamW(trainable_params, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) * n_epochs)
+    scaler = torch.cuda.amp.GradScaler()
     
     config = {
         'run_id': run_id,
@@ -341,61 +342,63 @@ def train_autoregressive_system(
             for length in context_lengths.tolist():
                 context_length_stats[length] += 1
             
-            # Forward: context through GPT with attention mask
-            gpt_output = gpt_core(compressed_context)  # (B, max_seq_len, 768)
-            
-            # Train on ALL autoregressive positions
-            # Position i predicts chunk at position i+1
-            loss = 0
-            num_predictions = 0
-            correct_tokens = 0
-            total_tokens = 0
-            
-            for i in range(batch_size):
-                seq_len = context_lengths[i].item()
-                # Train on positions 0 to seq_len-2 (each predicts the next chunk)
-                for pos in range(seq_len - 1):
-                    pred_vector = gpt_output[i, pos, :]  # (768,)
-                    reconstructed = decoder(pred_vector.unsqueeze(0), target_seq_len=chunk_size)  # (1, chunk_size, 768)
+            # Forward pass with mixed precision
+            with torch.cuda.amp.autocast():
+                # Forward: context through GPT with attention mask
+                gpt_output = gpt_core(compressed_context)  # (B, max_seq_len, 768)
+                
+                # Vectorized autoregressive training
+                # Collect all valid prediction positions into a batch
+                pred_vectors = []
+                pred_targets = []
+                
+                for i in range(batch_size):
+                    seq_len = context_lengths[i].item()
+                    # Positions 0 to seq_len-2 predict positions 1 to seq_len-1
+                    if seq_len > 1:
+                        pred_vectors.append(gpt_output[i, :seq_len-1, :])  # (seq_len-1, 768)
+                        pred_targets.append(target_ids[i, 1:seq_len, :])   # (seq_len-1, chunk_size)
+                
+                if len(pred_vectors) == 0:
+                    continue
                     
-                    if coherence:
-                        reconstructed = coherence(reconstructed)
-                    
-                    pred_logits = lm_head(reconstructed)  # (1, chunk_size, vocab_size)
-                    
-                    # Target is chunk at position pos+1
-                    target = target_ids[i, pos + 1, :]  # (chunk_size,)
-                    
-                    # Only compute loss on non-padding tokens
-                    valid_mask = target != -100
-                    if valid_mask.any():
-                        loss += F.cross_entropy(
-                            pred_logits.squeeze(0)[valid_mask], 
-                            target[valid_mask],
-                            ignore_index=-100
-                        )
-                        num_predictions += 1
-                        
-                        # Calculate accuracy
-                        preds = pred_logits.squeeze(0).argmax(dim=-1)
-                        correct_tokens += (preds[valid_mask] == target[valid_mask]).sum().item()
-                        total_tokens += valid_mask.sum().item()
+                # Stack all predictions into single batch
+                all_pred_vectors = torch.cat(pred_vectors, dim=0)  # (total_preds, 768)
+                all_targets = torch.cat(pred_targets, dim=0)        # (total_preds, chunk_size)
+                
+                # Decode all at once
+                reconstructed = decoder(all_pred_vectors, target_seq_len=chunk_size)  # (total_preds, chunk_size, 768)
+                
+                if coherence:
+                    reconstructed = coherence(reconstructed)
+                
+                pred_logits = lm_head(reconstructed)  # (total_preds, chunk_size, vocab_size)
+                
+                # Compute loss
+                loss = F.cross_entropy(
+                    pred_logits.reshape(-1, pred_logits.size(-1)),
+                    all_targets.reshape(-1),
+                    ignore_index=-100
+                )
             
-            if num_predictions > 0:
-                loss = loss / num_predictions
-            else:
-                loss = torch.tensor(0.0, device=device, requires_grad=True)
-            
-            acc = correct_tokens / total_tokens if total_tokens > 0 else 0.0
+            # Accuracy (outside autocast for stability)
+            preds = pred_logits.argmax(dim=-1)
+            valid_mask = all_targets != -100
+            correct = (preds[valid_mask] == all_targets[valid_mask]).sum().item()
+            total = valid_mask.sum().item()
+            acc = correct / total if total > 0 else 0.0
+            num_predictions = all_pred_vectors.size(0)
             
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(gpt_core.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(decoder.parameters(), 1.0)
             if coherence:
                 torch.nn.utils.clip_grad_norm_(coherence.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             
             epoch_loss += loss.item()
@@ -503,7 +506,7 @@ if __name__ == '__main__':
                         help='Output directory for training runs')
     parser.add_argument('--n_epochs', type=int, default=20,
                         help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size')
     parser.add_argument('--encoder_lr', type=float, default=1e-4,
                         help='Learning rate for encoder')
