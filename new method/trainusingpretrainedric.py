@@ -23,7 +23,7 @@ from decoder import SequenceDecoder
 from model.modelcore import GPTCore
 from model.tokenembedandun import Embedding
 from model.lmhead import LMHead
-from coherence_single_head import CoherenceAttention
+from coherence import CoherenceAttention
 
 
 def download_from_github(filename, release_tag, output_path):
