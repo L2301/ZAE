@@ -63,8 +63,8 @@ class NextSequencePredictionDataset(Dataset):
         
         # Load dataset
         if dataset_path is None or not Path(dataset_path).exists():
-            from data import download_and_tokenize_openwebtext
-            dataset_path = Path(download_and_tokenize_openwebtext())
+            from data import download_and_tokenize_c4
+            dataset_path = Path(download_and_tokenize_c4())
         
         self.data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
         # Need 2 sequences per sample
