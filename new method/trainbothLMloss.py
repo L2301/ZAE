@@ -16,7 +16,7 @@ from encoder import SequenceEncoder
 from decoder import SequenceDecoder
 from ZAE.router import GumbelClassifier
 from model.lmhead import LMHead
-from data import download_and_tokenize_openwebtext
+from data import download_and_tokenize_c4
 import urllib.request
 
 def download_encoder_from_github(output_path='checkpoints/encoder_from_github.pt'):
@@ -128,7 +128,7 @@ class JointTrainingDataset(Dataset):
         
         # Load dataset
         if dataset_path is None or not Path(dataset_path).exists():
-            dataset_path = Path(download_and_tokenize_openwebtext())
+            dataset_path = Path(download_and_tokenize_c4())
         
         self.data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
         self.n_samples = min(len(self.data) // seq_length, max_samples)

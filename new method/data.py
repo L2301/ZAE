@@ -9,12 +9,16 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 
-def download_and_tokenize_openwebtext(output_path='data/openwebtext.bin', max_samples=None):
-    """Download and tokenize OpenWebText dataset.
+"""
+Add this to your data.py file - uses C4 dataset instead of OpenWebText
+"""
+
+def download_and_tokenize_c4(output_path='data/c4.bin', max_samples=100000):
+    """Download and tokenize C4 dataset (Colossal Clean Crawled Corpus).
     
     Args:
         output_path: Where to save the tokenized data
-        max_samples: Maximum number of samples to process (None = all)
+        max_samples: Maximum number of samples to process
     
     Returns:
         Path to the tokenized binary file
@@ -29,28 +33,31 @@ def download_and_tokenize_openwebtext(output_path='data/openwebtext.bin', max_sa
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     if output_path.exists():
-        print(f"Using cached OpenWebText at {output_path}")
+        print(f"Using cached C4 at {output_path}")
         return str(output_path)
     
-    print("Downloading OpenWebText...")
-    # Use the correct loading method - load from the parquet files directly
+    print(f"Downloading C4 (en subset)...")
+    # Use C4 'en' (English) subset with streaming
     dataset = load_dataset(
-        'Skylion007/openwebtext',
+        'allenai/c4',
+        'en',
         split='train',
-        trust_remote_code=True  # This allows the dataset script to run
+        streaming=True
     )
     
-    if max_samples:
-        print(f"Limiting to {max_samples} samples...")
-        dataset = dataset.select(range(min(max_samples, len(dataset))))
-    
-    print(f"Tokenizing {len(dataset)} samples...")
+    print(f"Tokenizing up to {max_samples} samples...")
     tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
     
     all_tokens = []
-    for example in tqdm(dataset):
+    samples_processed = 0
+    
+    for example in tqdm(dataset, total=max_samples):
+        if samples_processed >= max_samples:
+            break
+        
         tokens = tokenizer.encode(example['text'], add_special_tokens=False)
         all_tokens.extend(tokens)
+        samples_processed += 1
     
     # Convert to numpy array and save
     tokens_array = np.array(all_tokens, dtype=np.uint16)
