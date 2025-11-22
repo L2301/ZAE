@@ -124,7 +124,7 @@ def finetune_encoder(
     joint_checkpoint_path='github',
     dataset_path=None,
     output_dir='train/encoder_finetune',
-    n_epochs=5,
+    n_epochs=10,
     batch_size=32,
     learning_rate=5e-6,
     device='cuda' if torch.cuda.is_available() else 'cpu',
@@ -211,12 +211,13 @@ def finetune_encoder(
         pin_memory=False
     )
     
-    # Optimizer for all three components with differential learning rates
-    optimizer = torch.optim.AdamW([
-        {'params': encoder.parameters(), 'lr': learning_rate},  # Encoder learns fastest
-        {'params': gpt_core.parameters(), 'lr': learning_rate},
-        {'params': decoder.parameters(), 'lr': learning_rate}
-    ], weight_decay=0.01)
+    # Optimizer for all three components with Muon
+    from muon import Muon
+    optimizer = Muon(
+        list(encoder.parameters()) + list(gpt_core.parameters()) + list(decoder.parameters()),
+        lr=learning_rate,
+        momentum=0.95
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) * n_epochs)
     
     config = {
