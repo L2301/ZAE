@@ -33,9 +33,15 @@ def download_and_tokenize_openwebtext(output_path='data/openwebtext.bin', max_sa
         return str(output_path)
     
     print("Downloading OpenWebText...")
-    dataset = load_dataset('Skylion007/openwebtext', split='train', streaming=False)
+    # Use the correct loading method - load from the parquet files directly
+    dataset = load_dataset(
+        'Skylion007/openwebtext',
+        split='train',
+        trust_remote_code=True  # This allows the dataset script to run
+    )
     
     if max_samples:
+        print(f"Limiting to {max_samples} samples...")
         dataset = dataset.select(range(min(max_samples, len(dataset))))
     
     print(f"Tokenizing {len(dataset)} samples...")
@@ -54,7 +60,6 @@ def download_and_tokenize_openwebtext(output_path='data/openwebtext.bin', max_sa
         tokens_array.tofile(f)
     
     return str(output_path)
-
 
 def download_and_tokenize_wikitext(output_path='data/wikitext.bin', split='train'):
     """Download and tokenize wikitext-103."""
