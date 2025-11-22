@@ -70,7 +70,7 @@ def load_pretrained_gpt2():
 class NextSequencePredictionDataset(Dataset):
     """Dataset for training to predict NEXT sequence from current sequence."""
     
-    def __init__(self, encoder, embedding, dataset_path, seq_length=4, max_samples=1000000, device='cpu'):
+    def __init__(self, encoder, embedding, dataset_path, seq_length=4, max_samples=10000000, device='cpu'):
         self.encoder = encoder.to(device)
         self.embedding = embedding.to(device)
         self.encoder.eval()
@@ -128,9 +128,9 @@ def train_full_system_scratch(
     coherence_lr=1e-4,
     device='cuda' if torch.cuda.is_available() else 'cpu',
     log_interval=100,
-    save_interval=10000,
+    save_interval=100000,
     seq_length=4,
-    max_samples=1000000,
+    max_samples=10000000,
     use_coherence=True
 ):
     """Train full system from scratch (except GPT-2 embedding/modelcore)."""
