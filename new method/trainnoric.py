@@ -111,6 +111,7 @@ class VariableContextDataset(Dataset):
     
     def __len__(self):
         return self.n_samples
+    
     def __getitem__(self, idx):
         """Generate training example with VARIABLE context length.
         
@@ -152,38 +153,44 @@ class VariableContextDataset(Dataset):
             'context_length': context_length
         }
 
+
 def variable_context_collate_fn(batch):
     """Custom collate function to handle variable-length contexts.
     
     Pads sequences to the longest in the batch and creates attention masks.
     
     Args:
-        batch: List of dicts with 'compressed_context', 'target_ids', 'context_length'
+        batch: List of dicts with 'compressed_context', 'all_target_ids', 'context_length'
     
     Returns:
         dict with padded tensors and attention masks
     """
     # Extract contexts and targets
     contexts = [item['compressed_context'] for item in batch]
-    targets = [item['all_target_ids'] for item in batch]  # List of variable-length tensors
-    padded_targets = pad_sequence(targets, batch_first=True, padding_value=-100)  # (B, max_len, chunk_size)
+    targets = [item['all_target_ids'] for item in batch]  # List of (seq_len, chunk_size)
     context_lengths = torch.tensor([item['context_length'] for item in batch])
     
     # Pad contexts to max length in batch
-    # pad_sequence expects list of tensors with shape (seq_len, features)
-    # Our contexts are (seq_len, 768), which is correct
     padded_contexts = pad_sequence(contexts, batch_first=True, padding_value=0.0)
     # Result is (batch, max_seq_len, 768)
     
+    # Pad targets - need to handle 2D tensors (seq_len, chunk_size)
+    max_len = max(t.size(0) for t in targets)
+    chunk_size = targets[0].size(1)
+    
+    padded_targets = torch.full((len(batch), max_len, chunk_size), -100, dtype=torch.long)
+    for i, target in enumerate(targets):
+        seq_len = target.size(0)
+        padded_targets[i, :seq_len, :] = target
+    
     # Create attention mask (1 for real tokens, 0 for padding)
-    max_len = padded_contexts.size(1)
     attention_mask = torch.zeros(len(batch), max_len, dtype=torch.bool)
     for i, length in enumerate(context_lengths):
         attention_mask[i, :length] = 1
     
     return {
         'compressed_context': padded_contexts,
-        'target_ids': targets,
+        'target_ids': padded_targets,  # (B, max_seq_len, chunk_size)
         'attention_mask': attention_mask,
         'context_lengths': context_lengths
     }
@@ -304,7 +311,7 @@ def train_autoregressive_system(
     print(f"Epochs: {n_epochs}")
     print(f"Batch size: {batch_size}")
     print(f"Context range: {min_context}-{max_context} chunks of {chunk_size} tokens each")
-    print(f"Task: Given [<seq0>, <seq1>, ..., <seqN>] → predict <seq(N+1)> where N varies\n")
+    print(f"Task: Given [<seq0>, <seq1>, ..., <seqN>] → predict all next sequences autoregressively\n")
     
     # Training loop
     encoder.train()
@@ -324,36 +331,62 @@ def train_autoregressive_system(
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{n_epochs}")
         for batch in pbar:
             compressed_context = batch['compressed_context'].to(device)  # (B, max_seq_len, 768)
-            target_ids = batch['target_ids'].to(device)  # (B, chunk_size)
+            target_ids = batch['target_ids'].to(device)  # (B, max_seq_len, chunk_size)
             attention_mask = batch['attention_mask'].to(device)  # (B, max_seq_len)
             context_lengths = batch['context_lengths']
+            
+            batch_size = compressed_context.size(0)
             
             # Track context length distribution
             for length in context_lengths.tolist():
                 context_length_stats[length] += 1
             
             # Forward: context through GPT with attention mask
-            # GPT processes sequence of compressed vectors
             gpt_output = gpt_core(compressed_context)  # (B, max_seq_len, 768)
+            
+            # Train on ALL autoregressive positions
+            # Position i predicts chunk at position i+1
             loss = 0
             num_predictions = 0
+            correct_tokens = 0
+            total_tokens = 0
+            
             for i in range(batch_size):
                 seq_len = context_lengths[i].item()
-                # Train on positions 0 to seq_len-2 (each predicts next)
+                # Train on positions 0 to seq_len-2 (each predicts the next chunk)
                 for pos in range(seq_len - 1):
                     pred_vector = gpt_output[i, pos, :]  # (768,)
-                    reconstructed = decoder(pred_vector.unsqueeze(0), target_seq_len=chunk_size)
+                    reconstructed = decoder(pred_vector.unsqueeze(0), target_seq_len=chunk_size)  # (1, chunk_size, 768)
+                    
                     if coherence:
                         reconstructed = coherence(reconstructed)
+                    
                     pred_logits = lm_head(reconstructed)  # (1, chunk_size, vocab_size)
                     
                     # Target is chunk at position pos+1
-                    target = padded_targets[i, pos+1, :]  # (chunk_size,)
-                    loss += F.cross_entropy(pred_logits.squeeze(0), target)
-                    num_predictions += 1
+                    target = target_ids[i, pos + 1, :]  # (chunk_size,)
+                    
+                    # Only compute loss on non-padding tokens
+                    valid_mask = target != -100
+                    if valid_mask.any():
+                        loss += F.cross_entropy(
+                            pred_logits.squeeze(0)[valid_mask], 
+                            target[valid_mask],
+                            ignore_index=-100
+                        )
+                        num_predictions += 1
+                        
+                        # Calculate accuracy
+                        preds = pred_logits.squeeze(0).argmax(dim=-1)
+                        correct_tokens += (preds[valid_mask] == target[valid_mask]).sum().item()
+                        total_tokens += valid_mask.sum().item()
             
-            acc = num_predictions / (batch_size * (context_lengths.max().item() - 1))
-            loss = loss / num_predictions
+            if num_predictions > 0:
+                loss = loss / num_predictions
+            else:
+                loss = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            acc = correct_tokens / total_tokens if total_tokens > 0 else 0.0
             
             optimizer.zero_grad()
             loss.backward()
@@ -366,15 +399,16 @@ def train_autoregressive_system(
             scheduler.step()
             
             epoch_loss += loss.item()
-            epoch_acc += acc.item()
+            epoch_acc += acc
             
             # Show stats including context length range in this batch
             min_ctx = context_lengths.min().item()
             max_ctx = context_lengths.max().item()
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
-                'acc': f"{acc.item():.3f}",
-                'ctx': f"{min_ctx}-{max_ctx}"
+                'acc': f"{acc:.3f}",
+                'ctx': f"{min_ctx}-{max_ctx}",
+                'preds': num_predictions
             })
             
             if global_step % log_interval == 0:
@@ -382,11 +416,12 @@ def train_autoregressive_system(
                     'step': global_step,
                     'epoch': epoch,
                     'loss': loss.item(),
-                    'accuracy': acc.item(),
+                    'accuracy': acc,
                     'lr': scheduler.get_last_lr()[0],
                     'batch_min_context': min_ctx,
                     'batch_max_context': max_ctx,
-                    'batch_avg_context': context_lengths.float().mean().item()
+                    'batch_avg_context': context_lengths.float().mean().item(),
+                    'num_predictions': num_predictions
                 })
             
             if global_step % save_interval == 0 and global_step > 0:
