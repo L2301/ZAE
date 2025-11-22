@@ -68,90 +68,97 @@ def load_pretrained_gpt2():
 
 
 class VariableContextDataset(Dataset):
-    """Dataset that provides VARIABLE context of N compressed sequences to predict sequence N+1.
+    """Dataset that provides VARIABLE context with ON-THE-FLY encoding.
     
-    Each sample can have a different context length between min_context and max_context.
-    This creates more robust training by exposing the model to varying amounts of context.
-    
-    Flow:
-    chunks [0,1,2,...,N-1] → encoder → [<seq0>, <seq1>, ..., <seqN-1>]
-    → GPT → [<seq0>, <seq1>, ..., <seqN-1>, <pred_seqN>]
-    → decoder(<pred_seqN>) → chunk_N tokens
-    
-    where N varies per sample from min_context to max_context
+    Encodes first half of epoch, then switches to second half while first half trains.
+    This allows streaming encoding without storing everything in memory.
     """
     
     def __init__(self, encoder, embedding, dataset_path, 
                  chunk_size=4, min_context=2, max_context=16, 
                  max_samples=1000000, device='cpu'):
-        self.encoder = encoder.to(device)
-        self.embedding = embedding.to(device)
-        self.encoder.eval()
-        self.embedding.eval()
+        self.encoder = encoder
+        self.embedding = embedding
         self.device = device
         self.chunk_size = chunk_size
         self.min_context = min_context
         self.max_context = max_context
     
-        for param in self.embedding.parameters():
-            param.requires_grad = False
-        
         # Load dataset
         if dataset_path is None or not Path(dataset_path).exists():
             from data import download_and_tokenize_c4
             dataset_path = Path(download_and_tokenize_c4())
         
         self.data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
-        # Need max_context + 1 chunks per sample (max context + target)
         total_tokens_needed = (max_context + 1) * chunk_size
         self.n_samples = min(len(self.data) // total_tokens_needed, max_samples)
         
+        # Pre-encoded cache for current half
+        self.cache = {}
+        self.cache_half = 0  # 0 or 1
+        self.samples_per_half = self.n_samples // 2
+        
         print(f"Dataset initialized: {self.n_samples} samples")
         print(f"Context range: {min_context}-{max_context} chunks of {chunk_size} tokens")
+        print(f"Streaming encoding: {self.samples_per_half} samples per half")
     
     def __len__(self):
         return self.n_samples
     
+    def _encode_half(self, half_idx):
+        """Pre-encode half of the dataset."""
+        print(f"\nPre-encoding half {half_idx+1}/2...")
+        self.encoder.eval()
+        self.embedding.eval()
+        self.encoder.to(self.device)
+        self.embedding.to(self.device)
+        
+        for param in self.embedding.parameters():
+            param.requires_grad = False
+        
+        start_sample = half_idx * self.samples_per_half
+        end_sample = start_sample + self.samples_per_half if half_idx == 0 else self.n_samples
+        
+        self.cache = {}
+        
+        with torch.no_grad():
+            for idx in tqdm(range(start_sample, end_sample), desc=f"Encoding half {half_idx+1}"):
+                context_length = torch.randint(self.min_context, self.max_context + 1, (1,)).item()
+                start_idx = idx * (self.max_context + 1) * self.chunk_size
+                
+                compressed_chunks = []
+                all_target_chunks = []
+                
+                for i in range(context_length):
+                    chunk_start = start_idx + i * self.chunk_size
+                    chunk_end = chunk_start + self.chunk_size
+                    chunk_tokens = self.data[chunk_start:chunk_end]
+                    chunk_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=self.device)
+                    
+                    tok_emb = self.embedding.token_only(chunk_ids.unsqueeze(0))
+                    compressed = self.encoder(tok_emb).squeeze(0).cpu()
+                    
+                    compressed_chunks.append(compressed)
+                    all_target_chunks.append(chunk_ids.cpu())
+                
+                self.cache[idx] = {
+                    'compressed_context': torch.stack(compressed_chunks),
+                    'all_target_ids': torch.stack(all_target_chunks),
+                    'context_length': context_length
+                }
+        
+        self.cache_half = half_idx
+        print(f"Encoded {len(self.cache)} samples for half {half_idx+1}")
+    
     def __getitem__(self, idx):
-        """Generate training example with VARIABLE context length.
+        """Return pre-encoded sample, triggering re-encode if needed."""
+        half_idx = 0 if idx < self.samples_per_half else 1
         
-        Returns:
-            compressed_context: (variable_context_length, 768) - encoded context chunks
-            all_target_ids: (variable_context_length, chunk_size) - ALL chunks for autoregressive training
-            context_length: int - actual context length for this sample
-        """
-        # Randomly choose context length for this sample
-        context_length = torch.randint(self.min_context, self.max_context + 1, (1,)).item()
+        # Switch halves if needed
+        if half_idx != self.cache_half:
+            self._encode_half(half_idx)
         
-        start_idx = idx * (self.max_context + 1) * self.chunk_size
-        
-        compressed_chunks = []
-        all_target_chunks = []
-        
-        # Encode ALL chunks (we need them as targets for autoregressive training)
-        for i in range(context_length):
-            chunk_start = start_idx + i * self.chunk_size
-            chunk_end = chunk_start + self.chunk_size
-            chunk_tokens = self.data[chunk_start:chunk_end]
-            chunk_ids = torch.tensor(chunk_tokens, dtype=torch.long, device=self.device)
-            
-            # Compress for input
-            with torch.no_grad():
-                tok_emb = self.embedding.token_only(chunk_ids.unsqueeze(0))
-                compressed = self.encoder(tok_emb).squeeze(0)  # (768,)
-            
-            compressed_chunks.append(compressed)
-            all_target_chunks.append(chunk_ids)
-        
-        # Stack
-        compressed_context = torch.stack(compressed_chunks)  # (context_length, 768)
-        all_target_ids = torch.stack(all_target_chunks)  # (context_length, chunk_size)
-        
-        return {
-            'compressed_context': compressed_context.cpu(),
-            'all_target_ids': all_target_ids.cpu(),
-            'context_length': context_length
-        }
+        return self.cache[idx]
 
 
 def variable_context_collate_fn(batch):
@@ -262,13 +269,18 @@ def train_autoregressive_system(
         device=device
     )
     
+    # Pre-encode first half before training starts
+    dataset._encode_half(0)
+    
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-        collate_fn=variable_context_collate_fn
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=variable_context_collate_fn,
+        persistent_workers=True,
+        prefetch_factor=2
     )
     
     # Optimizer - train everything except embedding
