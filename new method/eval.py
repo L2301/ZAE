@@ -4,8 +4,10 @@ from datasets import load_dataset
 from transformers import GPT2TokenizerFast
 from tqdm import tqdm
 import argparse
-import sys
 from pathlib import Path
+import sys
+
+# Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent))
 
 from encoder import SequenceEncoder
@@ -111,16 +113,22 @@ def evaluate_on_fineweb(
         if samples_processed >= num_samples:
             break
         
-        # Tokenize text
+        # Tokenize text without special tokens (matching training)
         text = example['text']
-        tokens = tokenizer.encode(text, max_length=seq_length, truncation=True, padding=False)
+        tokens = tokenizer.encode(text, add_special_tokens=False)
         
-        # Skip if not enough tokens
-        if len(tokens) < seq_length:
+        # Skip if empty
+        if len(tokens) == 0:
             continue
         
-        # Take first seq_length tokens
-        tokens = tokens[:seq_length]
+        # Take or pad to exact seq_length
+        if len(tokens) >= seq_length:
+            tokens = tokens[:seq_length]
+        else:
+            # Pad with a padding strategy: repeat last token to fill
+            # (better than EOS since model wasn't trained with EOS)
+            tokens = tokens + [tokens[-1]] * (seq_length - len(tokens))
+        
         input_ids = torch.tensor(tokens, dtype=torch.long, device=device)
         
         # Get embeddings
