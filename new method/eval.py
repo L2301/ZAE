@@ -4,7 +4,9 @@ from datasets import load_dataset
 from transformers import GPT2TokenizerFast
 from tqdm import tqdm
 import argparse
+import sys
 from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
 
 from encoder import SequenceEncoder
 from decoder import SequenceDecoder
