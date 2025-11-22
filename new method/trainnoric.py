@@ -486,7 +486,7 @@ if __name__ == '__main__':
                         help='Batch size')
     parser.add_argument('--encoder_lr', type=float, default=1e-4,
                         help='Learning rate for encoder')
-    parser.add_argument('--gpt_lr', type=float, default=5e-5,
+    parser.add_argument('--gpt_lr', type=float, default=1e-4,
                         help='Learning rate for GPT core')
     parser.add_argument('--decoder_lr', type=float, default=1e-4,
                         help='Learning rate for decoder')
